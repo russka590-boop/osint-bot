@@ -82,5 +82,15 @@ def register(plugin: OSINTPlugin) -> OSINTPlugin:
     return plugin
 
 
-def plugins_for(kind: TargetKind) -> list[OSINTPlugin]:
-    return [item for item in REGISTRY.values() if kind in item.input_types]
+EXTERNAL_PLUGINS = frozenset({"maigret", "blackbird"})
+
+
+def plugins_for(kind: TargetKind, engine: str = "all") -> list[OSINTPlugin]:
+    items = [plugin for plugin in REGISTRY.values() if kind in plugin.input_types]
+    if engine == "all":
+        return items
+    if engine == "own":
+        return [plugin for plugin in items if plugin.name not in EXTERNAL_PLUGINS]
+    if engine == "external":
+        return [plugin for plugin in items if plugin.name in EXTERNAL_PLUGINS]
+    return [plugin for plugin in items if plugin.name == engine]

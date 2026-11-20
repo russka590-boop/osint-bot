@@ -27,7 +27,7 @@ from bot.core.report import build_markdown, summary_text, write_report
 from bot.core.runner import Runner
 from bot.core.storage import Storage
 from bot.core.utils import chunk, detect_kind, human_duration, normalize
-from bot.keyboards import kinds_keyboard
+from bot.keyboards import ENGINE_TITLES, engines_keyboard, kinds_keyboard
 from bot.plugins import load_plugins
 
 log = logging.getLogger(__name__)
@@ -48,6 +48,9 @@ WELCOME = (
     "— телефон: страна, оператор и регион номера (без владельца).\n\n"
     "Команды:\n"
     "/scan <тип> <цель> — тип: username, email, domain, url, ip, phone\n"
+    "/scan maigret <цель> — только Maigret (полная база площадок)\n"
+    "/scan blackbird <цель> — только BlackBird\n"
+    "/scan own <цель> — только наши модули\n"
     "/archives <url> — только веб-архивы\n"
     "/plugins — какие модули доступны\n"
     "/stats — ваша статистика\n"
@@ -106,16 +109,44 @@ async def _plugins_report() -> str:
 
 
 @router.callback_query(F.data.startswith("kind:"))
-async def cb_kind(callback: CallbackQuery, state: FSMContext) -> None:
+async def cb_kind(callback: CallbackQuery) -> None:
     raw = (callback.data or "").split(":", 1)[-1]
     try:
         kind = TargetKind(raw)
     except ValueError:
         await callback.answer("Неизвестный тип", show_alert=True)
         return
+    await callback.message.answer(
+        f"{kind.title}: выберите источник поиска", reply_markup=engines_keyboard(kind)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("mode:"))
+async def cb_mode(callback: CallbackQuery, state: FSMContext) -> None:
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3:
+        await callback.answer("Некорректный выбор", show_alert=True)
+        return
+    _, engine, kind_raw = parts
+    try:
+        kind = TargetKind(kind_raw)
+    except ValueError:
+        await callback.answer("Неизвестный тип", show_alert=True)
+        return
     await state.set_state(ScanForm.waiting_target)
-    await state.update_data(kind=kind.value)
-    await callback.message.answer(f"{kind.title}: пришлите цель одним сообщением.")
+    await state.update_data(kind=kind.value, engine=engine)
+    title = ENGINE_TITLES.get(engine, engine)
+    await callback.message.answer(
+        f"{kind.title} · {title}\nПришлите цель одним сообщением."
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "menu:back")
+async def cb_back(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.message.answer("Выберите тип цели:", reply_markup=kinds_keyboard())
     await callback.answer()
 
 
@@ -127,27 +158,40 @@ async def got_target(message: Message, state: FSMContext) -> None:
         kind = TargetKind(data.get("kind", "username"))
     except ValueError:
         kind = TargetKind.USERNAME
-    await scan_and_reply(message, kind, (message.text or "").strip())
+    engine = str(data.get("engine") or "all")
+    await scan_and_reply(message, kind, (message.text or "").strip(), engine=engine)
+
+
+ENGINES = ("all", "own", "maigret", "blackbird")
+KIND_NAMES = {kind.value for kind in TargetKind}
+
+
+def parse_scan_args(args: str) -> tuple[str, TargetKind | None, str]:
+    engine = "all"
+    tokens = args.split(maxsplit=1)
+    if tokens and tokens[0].lower() in ENGINES:
+        engine = tokens[0].lower()
+        args = tokens[1].strip() if len(tokens) > 1 else ""
+    if not args:
+        return engine, None, ""
+    parts = args.split(maxsplit=1)
+    if len(parts) == 2 and parts[0].lower() in KIND_NAMES:
+        return engine, TargetKind(parts[0].lower()), parts[1].strip()
+    return engine, detect_kind(args), args
 
 
 @router.message(Command("scan"))
 async def cmd_scan(message: Message, command: CommandObject) -> None:
-    args = (command.args or "").strip()
-    if not args:
-        await message.answer("Формат: /scan username vasya или /scan domain example.com")
+    engine, kind, target = parse_scan_args((command.args or "").strip())
+    if kind is None or not target:
+        await message.answer(
+            "Формат: /scan [движок] [тип] цель\n"
+            "движок: all, own, maigret, blackbird\n"
+            "тип: username, email, domain, url, ip, phone\n"
+            "Примеры: /scan maigret durov, /scan domain example.com"
+        )
         return
-    parts = args.split(maxsplit=1)
-    if len(parts) == 1:
-        kind = detect_kind(parts[0])
-        await scan_and_reply(message, kind, parts[0])
-        return
-    raw_kind, target = parts
-    try:
-        kind = TargetKind(raw_kind.lower())
-    except ValueError:
-        await message.answer("Тип цели: username, email, domain или url.")
-        return
-    await scan_and_reply(message, kind, target.strip())
+    await scan_and_reply(message, kind, target, engine=engine)
 
 
 @router.message(Command("archives"))
@@ -207,6 +251,7 @@ async def scan_and_reply(
     kind: TargetKind,
     raw: str,
     only: set[str] | None = None,
+    engine: str = "all",
 ) -> None:
     user = message.from_user
     if user is None:
@@ -221,9 +266,15 @@ async def scan_and_reply(
         await message.answer(f"Неверная цель — {error}")
         return
 
-    candidates = [plugin for plugin in plugins_for(kind) if only is None or plugin.name in only]
+    candidates = [
+        plugin
+        for plugin in plugins_for(kind, engine)
+        if only is None or plugin.name in only
+    ]
     if not candidates:
-        await message.answer("Для этого типа цели нет модулей.")
+        await message.answer(
+            f"Для режима «{ENGINE_TITLES.get(engine, engine)}» нет модулей под этот тип цели."
+        )
         return
 
     active = []
@@ -244,7 +295,8 @@ async def scan_and_reply(
         plugin.name == "maigret" for plugin in active
     ) else ""
     status = await message.answer(
-        f"Сканирую: {target}\nТип: {kind.title}\nМодулей: {len(active)}{hint}"
+        f"Сканирую: {target}\nТип: {kind.title}\n"
+        f"Режим: {ENGINE_TITLES.get(engine, engine)}\nМодулей: {len(active)}{hint}"
     )
     began = time.perf_counter()
 
