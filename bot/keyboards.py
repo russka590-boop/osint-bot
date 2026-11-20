@@ -14,6 +14,10 @@ def kinds_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="Домен", callback_data="kind:domain"),
                 InlineKeyboardButton(text="URL / архивы", callback_data="kind:url"),
             ],
+            [
+                InlineKeyboardButton(text="IP-адрес", callback_data="kind:ip"),
+                InlineKeyboardButton(text="Телефон", callback_data="kind:phone"),
+            ],
             [InlineKeyboardButton(text="Состояние модулей", callback_data="plugins:list")],
         ]
     )

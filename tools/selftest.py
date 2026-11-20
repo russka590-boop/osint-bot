@@ -9,7 +9,7 @@ sys.path.insert(0, str(ROOT))
 
 from bot.core.plugin import Finding, PluginResult, TargetKind  # noqa: E402
 from bot.core.report import build_markdown, summary_text  # noqa: E402
-from bot.core.utils import chunk, detect_kind, normalize  # noqa: E402
+from bot.core.utils import chunk, detect_kind, normalize, to_ip, to_phone  # noqa: E402
 from bot.plugins.archives_plugin import (  # noqa: E402
     parse_cdx,
     parse_commoncrawl,
@@ -18,6 +18,9 @@ from bot.plugins.archives_plugin import (  # noqa: E402
 from bot.plugins.blackbird_plugin import parse_blackbird  # noqa: E402
 from bot.plugins.domains_plugin import parse_crtsh  # noqa: E402
 from bot.plugins.maigret_plugin import parse_maigret  # noqa: E402
+from bot.plugins.rdap_plugin import parse_rdap_domain, parse_rdap_ip  # noqa: E402
+from bot.plugins.telegram_plugin import parse_telegram  # noqa: E402
+from bot.plugins.vk_plugin import parse_vk_subscriptions, parse_vk_user  # noqa: E402
 
 CHECKS: list[tuple[str, bool, str]] = []
 
@@ -96,6 +99,75 @@ def main() -> int:
 
     crt = '[{"name_value": "www.example.com\\nexample.com", "issuer_name": "CA", "not_before": "2024-01-01T00:00:00"}]'
     check("crt.sh", len(parse_crtsh(crt)) == 2)
+
+    ok, value, _ = to_phone("8 (999) 123-45-67")
+    check("phone нормализация", ok and value == "+79991234567", value)
+
+    ok, value, _ = to_ip(" 8.8.8.8 ")
+    check("ip нормализация", ok and value == "8.8.8.8", value)
+
+    tg_page = (
+        '<div class="tgme_page_title"><span dir="auto">Pavel Durov</span></div>'
+        '<div class="tgme_page_extra">12 345 subscribers</div>'
+    )
+    tg = parse_telegram("durov", tg_page)
+    check("telegram: профиль", tg is not None and tg.status == "found" and "12 345" in (tg.details or ""))
+
+    tg_free = parse_telegram(
+        "free_nick",
+        '<div class="tgme_page_title"><span dir="auto">Telegram: Contact @free_nick</span></div>',
+    )
+    check("telegram: свободный ник", tg_free is not None and tg_free.status == "not_found")
+
+    vk_user = parse_vk_user(
+        [
+            {
+                "id": 1,
+                "first_name": "Pavel",
+                "last_name": "Durov",
+                "screen_name": "durov",
+                "followers_count": 100,
+                "verified": 1,
+                "city": {"title": "Санкт-Петербург"},
+            }
+        ]
+    )
+    check("vk: профиль", vk_user is not None and vk_user.url == "https://vk.com/durov", str(vk_user))
+
+    vk_subs = parse_vk_subscriptions({"items": [{"name": "Канал", "screen_name": "chan"}]})
+    check("vk: подписки", len(vk_subs) == 1 and vk_subs[0].url == "https://vk.com/chan")
+
+    rdap_domain = parse_rdap_domain(
+        {
+            "ldhName": "EXAMPLE.COM",
+            "status": ["active"],
+            "events": [{"eventAction": "registration", "eventDate": "1997-09-15T04:00:00Z"}],
+            "entities": [
+                {
+                    "roles": ["registrar"],
+                    "vcardArray": ["vcard", [["version", {}, "text", "4.0"], ["fn", {}, "text", "REG LLC"]]],
+                }
+            ],
+        }
+    )
+    check(
+        "rdap: домен",
+        rdap_domain is not None
+        and "REG LLC" in (rdap_domain.details or "")
+        and "1997-09-15" in (rdap_domain.details or ""),
+        str(rdap_domain),
+    )
+
+    rdap_ip = parse_rdap_ip(
+        {
+            "handle": "8.8.8.0 - 8.8.8.255",
+            "name": "GOGL",
+            "country": "US",
+            "startAddress": "8.8.8.0",
+            "endAddress": "8.8.8.255",
+        }
+    )
+    check("rdap: ip", rdap_ip is not None and "US" in (rdap_ip.details or ""), str(rdap_ip))
 
     results = [
         PluginResult(

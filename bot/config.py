@@ -68,6 +68,8 @@ class Settings:
     blackbird_args: str = field(default_factory=lambda: os.getenv("BLACKBIRD_ARGS", "").strip())
     blackbird_timeout: int = field(default_factory=lambda: _int("BLACKBIRD_TIMEOUT", 180))
 
+    vk_token: str = field(default_factory=lambda: os.getenv("VK_TOKEN", "").strip())
+
     report_dir: Path = field(default_factory=lambda: _path("REPORT_DIR", BASE_DIR / "data" / "reports"))
     db_path: Path = field(default_factory=lambda: _path("DB_PATH", BASE_DIR / "data" / "bot.sqlite3"))
 
