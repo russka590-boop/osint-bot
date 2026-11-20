@@ -122,3 +122,22 @@ sudo docker compose exec bot pip install maigret
 
 либо соберите образ с `INSTALL_MAIGRET: "1"` в `docker-compose.yml`.
 Для `blackbird` укажите в `.env` путь к скрипту внутри контейнера.
+
+## Вариант без сервера: GitHub Actions (бесплатно)
+
+Бот живёт на раннерах GitHub: бесплатно для публичных репозиториев, 4 ядра и 16 ГБ RAM,
+`maigret` устанавливается на лету, `blackbird` тоже влезает.
+
+Как это работает: workflow `.github/workflows/bot.yml` запускается по расписанию каждые
+6 часов и держит процесс 340 минут. Между запусками пауза 10–20 минут; сообщения не теряются,
+Telegram отдаёт их при переподключении.
+
+Настройка:
+
+1. Создайте публичный репозиторий на GitHub и загрузите туда папку проекта.
+2. Settings → Secrets and variables → Actions → New repository secret:
+   `BOT_TOKEN`, `ALLOWED_USER_IDS`, `ADMIN_IDS`.
+3. Вкладка Actions → workflow `osint-bot` → Run workflow.
+
+Ограничения: отчёты и SQLite между запусками не сохраняются; через 60 дней без коммитов
+GitHub отключает расписание — достаточно нажать Run workflow.

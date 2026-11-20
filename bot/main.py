@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -15,6 +14,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
     CallbackQuery,
+    ErrorEvent,
     FSInputFile,
     Message,
 )
@@ -188,6 +188,18 @@ async def free_text(message: Message) -> None:
     await scan_and_reply(message, detect_kind(raw), raw)
 
 
+@router.errors()
+async def on_error(event: ErrorEvent) -> bool:
+    log.error("ошибка обработки обновления", exc_info=event.exception)
+    message = event.update.message
+    if message is not None:
+        try:
+            await message.answer("Не получилось обработать запрос. Попробуйте ещё раз.")
+        except Exception:  # noqa: BLE001
+            pass
+    return True
+
+
 async def scan_and_reply(
     message: Message,
     kind: TargetKind,
@@ -296,7 +308,7 @@ async def main() -> None:
     await storage.connect()
     load_plugins()
 
-    bot = Bot(settings.token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    bot = Bot(settings.token, default=DefaultBotProperties())
     dispatcher = Dispatcher(storage=MemoryStorage())
     dispatcher.message.middleware(AccessMiddleware())
     dispatcher.callback_query.middleware(AccessMiddleware())
