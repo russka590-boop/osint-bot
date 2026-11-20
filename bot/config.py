@@ -61,9 +61,9 @@ class Settings:
 
     maigret_cmd: str = field(default_factory=lambda: os.getenv("MAIGRET_CMD", "maigret").strip())
     maigret_args: str = field(
-        default_factory=lambda: os.getenv("MAIGRET_ARGS", "--top-sites 500").strip()
+        default_factory=lambda: os.getenv("MAIGRET_ARGS", "-a").strip()
     )
-    maigret_timeout: int = field(default_factory=lambda: _int("MAIGRET_TIMEOUT", 180))
+    maigret_timeout: int = field(default_factory=lambda: _int("MAIGRET_TIMEOUT", 900))
     blackbird_cmd: str = field(default_factory=lambda: os.getenv("BLACKBIRD_CMD", "").strip())
     blackbird_args: str = field(default_factory=lambda: os.getenv("BLACKBIRD_ARGS", "").strip())
     blackbird_timeout: int = field(default_factory=lambda: _int("BLACKBIRD_TIMEOUT", 180))

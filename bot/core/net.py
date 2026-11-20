@@ -80,6 +80,36 @@ async def get_json(
         return None, f"невалидный JSON: {exc}"
 
 
+async def get_json_status(
+    url: str,
+    *,
+    timeout: float = 25,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, Any, str]:
+    import aiohttp
+    import json
+
+    try:
+        session = await get_session()
+        async with session.get(
+            url,
+            headers=headers,
+            allow_redirects=True,
+            timeout=aiohttp.ClientTimeout(total=timeout),
+        ) as response:
+            text = await response.text(errors="replace")
+            if response.status != 200:
+                return response.status, None, f"HTTP {response.status}"
+            try:
+                return 200, json.loads(text), ""
+            except json.JSONDecodeError as exc:
+                return 200, None, f"невалидный JSON: {exc}"
+    except asyncio.TimeoutError:
+        return 0, None, f"таймаут {timeout:.0f} с"
+    except Exception as exc:  # noqa: BLE001
+        return 0, None, f"{type(exc).__name__}: {exc}"
+
+
 async def head_status(url: str, *, timeout: float = 20) -> tuple[int | None, str | None, str]:
     import aiohttp
 

@@ -32,5 +32,6 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ALLOWED_USER_IDS: ${{ secrets.ALLOWED_USER_IDS }}
           ADMIN_IDS: ${{ secrets.ADMIN_IDS }}
-          MAIGRET_ARGS: "--top-sites 500"
+          MAIGRET_ARGS: "-a"
+          MAIGRET_TIMEOUT: "900"
         run: timeout 340m python main.py || true

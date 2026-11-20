@@ -6,6 +6,8 @@ from pathlib import Path
 from bot.core.plugin import PluginResult, TargetKind
 from bot.core.utils import human_duration, safe_filename
 
+MAX_ROWS = 200
+
 
 def build_markdown(
     kind: TargetKind,
@@ -43,11 +45,15 @@ def build_markdown(
         if result.findings:
             lines.append("| Источник | Статус | Ссылка | Детали |")
             lines.append("| --- | --- | --- | --- |")
-            for finding in result.findings:
+            for finding in result.findings[:MAX_ROWS]:
                 url = f"[{_short(finding.url)}]({finding.url})" if finding.url else "—"
                 details = (finding.details or "—").replace("|", "\\|").replace("\n", " ")
                 source = finding.source.replace("|", "\\|")
                 lines.append(f"| {source} | {finding.status} | {url} | {details} |")
+            hidden = len(result.findings) - MAX_ROWS
+            if hidden > 0:
+                lines.append("")
+                lines.append(f"…ещё {hidden} строк не показано, полный список — в исходных данных скана.")
         else:
             lines.append("Ничего не найдено.")
         lines.append("")

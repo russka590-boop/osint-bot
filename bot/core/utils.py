@@ -59,11 +59,40 @@ def to_url(raw: str) -> tuple[bool, str, str]:
     return True, value, ""
 
 
+def to_ip(raw: str) -> tuple[bool, str, str]:
+    import ipaddress
+
+    value = _clean(raw)
+    try:
+        return True, str(ipaddress.ip_address(value)), ""
+    except ValueError:
+        return False, value, "ip: формат 8.8.8.8 или 2001:db8::1"
+
+
+def to_phone(raw: str) -> tuple[bool, str, str]:
+    value = _clean(raw)
+    digits = re.sub(r"[^\d]", "", value)
+    if value.startswith("+"):
+        digits = "+" + digits
+    if digits.startswith("8") and len(digits) == 11:
+        digits = "+7" + digits[1:]
+    elif digits.startswith("7") and len(digits) == 11:
+        digits = "+" + digits
+    elif not digits.startswith("+") and len(digits) == 10:
+        digits = "+7" + digits
+    digits = digits.replace("+", "")
+    if not digits.isdigit() or not 10 <= len(digits) <= 15:
+        return False, value, "телефон: формат +79991234567"
+    return True, "+" + digits, ""
+
+
 _NORMALIZERS = {
     TargetKind.USERNAME: to_username,
     TargetKind.EMAIL: to_email,
     TargetKind.DOMAIN: to_domain,
     TargetKind.URL: to_url,
+    TargetKind.IP: to_ip,
+    TargetKind.PHONE: to_phone,
 }
 
 
@@ -72,11 +101,20 @@ def normalize(kind: TargetKind, raw: str) -> tuple[bool, str, str]:
 
 
 def detect_kind(raw: str) -> TargetKind:
+    import ipaddress
+
     value = _clean(raw)
     if value.startswith(("http://", "https://")):
         return TargetKind.URL
     if "@" in value and "." in value.split("@", 1)[-1]:
         return TargetKind.EMAIL
+    try:
+        ipaddress.ip_address(value)
+        return TargetKind.IP
+    except ValueError:
+        pass
+    if re.fullmatch(r"\+?\d[\d\s\-()]{8,}", value):
+        return TargetKind.PHONE
     if DOMAIN_RE.match(value.lower().split("/", 1)[0]):
         return TargetKind.DOMAIN
     return TargetKind.USERNAME

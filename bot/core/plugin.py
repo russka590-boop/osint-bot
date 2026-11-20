@@ -10,6 +10,8 @@ class TargetKind(str, Enum):
     EMAIL = "email"
     DOMAIN = "domain"
     URL = "url"
+    IP = "ip"
+    PHONE = "phone"
 
     @property
     def title(self) -> str:
@@ -21,6 +23,8 @@ _KIND_TITLES = {
     TargetKind.EMAIL: "Email",
     TargetKind.DOMAIN: "Домен",
     TargetKind.URL: "URL",
+    TargetKind.IP: "IP-адрес",
+    TargetKind.PHONE: "Телефон",
 }
 
 

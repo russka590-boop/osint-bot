@@ -1,0 +1,2524 @@
+
+================================================================================
+ФАЙЛ: bot\__init__.py
+================================================================================
+
+
+
+================================================================================
+ФАЙЛ: bot\config.py
+================================================================================
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+def _load_dotenv(path: Path) -> None:
+    if not path.exists():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        os.environ.setdefault(key, value)
+
+
+_load_dotenv(BASE_DIR / ".env")
+
+
+def _ids(name: str) -> frozenset[int]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return frozenset()
+    out: set[int] = set()
+    for part in raw.replace(";", ",").replace(" ", ",").split(","):
+        part = part.strip()
+        if part.lstrip("-").isdigit():
+            out.add(int(part))
+    return frozenset(out)
+
+
+def _int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _path(name: str, default: Path) -> Path:
+    raw = os.getenv(name, "").strip()
+    return Path(raw).expanduser() if raw else default
+
+
+@dataclass(frozen=True)
+class Settings:
+    token: str = field(default_factory=lambda: os.getenv("BOT_TOKEN", "").strip())
+    admin_ids: frozenset[int] = field(default_factory=lambda: _ids("ADMIN_IDS"))
+    allowed_ids: frozenset[int] = field(default_factory=lambda: _ids("ALLOWED_USER_IDS"))
+    max_concurrent_jobs: int = field(default_factory=lambda: _int("MAX_CONCURRENT_JOBS", 4))
+    user_cooldown: int = field(default_factory=lambda: _int("USER_COOLDOWN_SEC", 30))
+    max_targets_per_scan: int = field(default_factory=lambda: _int("MAX_PLUGINS_PER_SCAN", 6))
+
+    maigret_cmd: str = field(default_factory=lambda: os.getenv("MAIGRET_CMD", "maigret").strip())
+    maigret_args: str = field(
+        default_factory=lambda: os.getenv("MAIGRET_ARGS", "--top-sites 500").strip()
+    )
+    maigret_timeout: int = field(default_factory=lambda: _int("MAIGRET_TIMEOUT", 180))
+    blackbird_cmd: str = field(default_factory=lambda: os.getenv("BLACKBIRD_CMD", "").strip())
+    blackbird_args: str = field(default_factory=lambda: os.getenv("BLACKBIRD_ARGS", "").strip())
+    blackbird_timeout: int = field(default_factory=lambda: _int("BLACKBIRD_TIMEOUT", 180))
+
+    report_dir: Path = field(default_factory=lambda: _path("REPORT_DIR", BASE_DIR / "data" / "reports"))
+    db_path: Path = field(default_factory=lambda: _path("DB_PATH", BASE_DIR / "data" / "bot.sqlite3"))
+
+    def ensure_dirs(self) -> None:
+        self.report_dir.mkdir(parents=True, exist_ok=True)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def is_admin(self, user_id: int) -> bool:
+        return user_id in self.admin_ids
+
+
+settings = Settings()
+
+
+================================================================================
+ФАЙЛ: bot\core\__init__.py
+================================================================================
+
+
+
+================================================================================
+ФАЙЛ: bot\core\access.py
+================================================================================
+
+from __future__ import annotations
+
+import time
+from typing import Any, Awaitable, Callable
+
+from aiogram import BaseMiddleware
+from aiogram.types import CallbackQuery, Message, TelegramObject
+
+from bot.config import settings
+
+Handler = Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]]
+
+DENY_TEXT = "Доступ к боту закрыт. Передайте свой ID администратору."
+
+
+def is_allowed(user_id: int) -> bool:
+    if settings.is_admin(user_id):
+        return True
+    if not settings.allowed_ids:
+        return True
+    return user_id in settings.allowed_ids
+
+
+class AccessMiddleware(BaseMiddleware):
+    async def __call__(self, handler: Handler, event: TelegramObject, data: dict[str, Any]) -> Any:
+        user = data.get("event_from_user")
+        if user is None:
+            return await handler(event, data)
+        if not is_allowed(user.id):
+            if isinstance(event, Message):
+                await event.answer(f"{DENY_TEXT}\nВаш ID: {user.id}")
+            elif isinstance(event, CallbackQuery):
+                await event.answer(f"{DENY_TEXT} Ваш ID: {user.id}", show_alert=True)
+            return None
+        return await handler(event, data)
+
+
+class Cooldown:
+    def __init__(self, seconds: int) -> None:
+        self._seconds = seconds
+        self._last: dict[int, float] = {}
+
+    def check(self, user_id: int) -> int:
+        if self._seconds <= 0:
+            return 0
+        now = time.monotonic()
+        last = self._last.get(user_id, 0.0)
+        remaining = self._seconds - (now - last)
+        if remaining > 0:
+            return int(remaining) + 1
+        self._last[user_id] = now
+        return 0
+
+
+cooldown = Cooldown(settings.user_cooldown)
+
+
+================================================================================
+ФАЙЛ: bot\core\cli.py
+================================================================================
+
+from __future__ import annotations
+
+import asyncio
+import shlex
+import shutil
+
+IS_WINDOWS = __import__("sys").platform.startswith("win")
+
+
+async def run_cli(
+    cmd: list[str],
+    *,
+    timeout: float,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+) -> tuple[int, str, str]:
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+        env=env,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+        raise
+    return (
+        process.returncode or 0,
+        stdout.decode("utf-8", errors="replace"),
+        stderr.decode("utf-8", errors="replace"),
+    )
+
+
+def split_command(raw: str) -> list[str]:
+    if not raw.strip():
+        return []
+    return shlex.split(raw, posix=not IS_WINDOWS)
+
+
+def find_binary(raw: str) -> str | None:
+    parts = split_command(raw)
+    if not parts:
+        return None
+    return shutil.which(parts[0])
+
+
+================================================================================
+ФАЙЛ: bot\core\net.py
+================================================================================
+
+from __future__ import annotations
+
+import asyncio
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import aiohttp
+
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
+_session: Any = None
+_lock: asyncio.Lock | None = None
+
+
+async def get_session() -> Any:
+    global _session, _lock
+    import aiohttp
+
+    if _lock is None:
+        _lock = asyncio.Lock()
+    if _session is None or _session.closed:
+        async with _lock:
+            if _session is None or _session.closed:
+                _session = aiohttp.ClientSession(
+                    headers={"User-Agent": USER_AGENT, "Accept": "*/*"},
+                    timeout=aiohttp.ClientTimeout(total=40),
+                )
+    return _session
+
+
+async def close() -> None:
+    global _session
+    if _session is not None and not _session.closed:
+        await _session.close()
+    _session = None
+
+
+async def get_text(
+    url: str,
+    *,
+    timeout: float = 25,
+    headers: dict[str, str] | None = None,
+    allow_redirects: bool = True,
+) -> tuple[str | None, str]:
+    import aiohttp
+
+    try:
+        session = await get_session()
+        async with session.get(
+            url,
+            headers=headers,
+            allow_redirects=allow_redirects,
+            timeout=aiohttp.ClientTimeout(total=timeout),
+        ) as response:
+            if response.status >= 400:
+                return None, f"HTTP {response.status}"
+            return await response.text(errors="replace"), ""
+    except asyncio.TimeoutError:
+        return None, f"таймаут {timeout:.0f} с"
+    except aiohttp.ClientError as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+async def get_json(
+    url: str,
+    *,
+    timeout: float = 25,
+    headers: dict[str, str] | None = None,
+) -> tuple[Any, str]:
+    import json
+
+    text, error = await get_text(url, timeout=timeout, headers=headers)
+    if error:
+        return None, error
+    try:
+        return json.loads(text or ""), ""
+    except json.JSONDecodeError as exc:
+        return None, f"невалидный JSON: {exc}"
+
+
+async def get_json_status(
+    url: str,
+    *,
+    timeout: float = 25,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, Any, str]:
+    import aiohttp
+    import json
+
+    try:
+        session = await get_session()
+        async with session.get(
+            url,
+            headers=headers,
+            allow_redirects=True,
+            timeout=aiohttp.ClientTimeout(total=timeout),
+        ) as response:
+            text = await response.text(errors="replace")
+            if response.status != 200:
+                return response.status, None, f"HTTP {response.status}"
+            try:
+                return 200, json.loads(text), ""
+            except json.JSONDecodeError as exc:
+                return 200, None, f"невалидный JSON: {exc}"
+    except asyncio.TimeoutError:
+        return 0, None, f"таймаут {timeout:.0f} с"
+    except Exception as exc:  # noqa: BLE001
+        return 0, None, f"{type(exc).__name__}: {exc}"
+
+
+async def head_status(url: str, *, timeout: float = 20) -> tuple[int | None, str | None, str]:
+    import aiohttp
+
+    try:
+        session = await get_session()
+        async with session.get(
+            url,
+            allow_redirects=False,
+            timeout=aiohttp.ClientTimeout(total=timeout),
+            headers={"Accept": "text/html"},
+        ) as response:
+            return response.status, response.headers.get("Location"), ""
+    except asyncio.TimeoutError:
+        return None, None, f"таймаут {timeout:.0f} с"
+    except Exception as exc:  # noqa: BLE001
+        return None, None, f"{type(exc).__name__}: {exc}"
+
+
+================================================================================
+ФАЙЛ: bot\core\plugin.py
+================================================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import ClassVar
+
+
+class TargetKind(str, Enum):
+    USERNAME = "username"
+    EMAIL = "email"
+    DOMAIN = "domain"
+    URL = "url"
+    IP = "ip"
+    PHONE = "phone"
+
+    @property
+    def title(self) -> str:
+        return _KIND_TITLES[self]
+
+
+_KIND_TITLES = {
+    TargetKind.USERNAME: "Имя пользователя",
+    TargetKind.EMAIL: "Email",
+    TargetKind.DOMAIN: "Домен",
+    TargetKind.URL: "URL",
+    TargetKind.IP: "IP-адрес",
+    TargetKind.PHONE: "Телефон",
+}
+
+
+@dataclass(slots=True)
+class Finding:
+    source: str
+    status: str
+    url: str | None = None
+    details: str | None = None
+
+
+@dataclass(slots=True)
+class PluginResult:
+    plugin: str
+    title: str
+    target: str
+    findings: list[Finding] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    elapsed: float = 0.0
+    ok: bool = True
+
+    @property
+    def found(self) -> list[Finding]:
+        return [item for item in self.findings if item.status == "found"]
+
+    @property
+    def checked(self) -> int:
+        return len([item for item in self.findings if item.status in ("found", "not_found")])
+
+
+class OSINTPlugin:
+    name: ClassVar[str] = ""
+    title: ClassVar[str] = ""
+    description: ClassVar[str] = ""
+    input_types: ClassVar[tuple[TargetKind, ...]] = ()
+    requires_binary: ClassVar[str | None] = None
+    default_timeout: ClassVar[int] = 120
+
+    async def ready(self) -> tuple[bool, str]:
+        return True, ""
+
+    async def run(self, target: str) -> PluginResult:
+        raise NotImplementedError
+
+
+REGISTRY: dict[str, OSINTPlugin] = {}
+
+
+def register(plugin: OSINTPlugin) -> OSINTPlugin:
+    if not plugin.name:
+        raise ValueError("plugin.name is required")
+    if plugin.name in REGISTRY:
+        raise ValueError(f"duplicate plugin name: {plugin.name}")
+    REGISTRY[plugin.name] = plugin
+    return plugin
+
+
+def plugins_for(kind: TargetKind) -> list[OSINTPlugin]:
+    return [item for item in REGISTRY.values() if kind in item.input_types]
+
+
+================================================================================
+ФАЙЛ: bot\core\report.py
+================================================================================
+
+from __future__ import annotations
+
+from datetime import datetime
+from pathlib import Path
+
+from bot.core.plugin import PluginResult, TargetKind
+from bot.core.utils import human_duration, safe_filename
+
+
+def build_markdown(
+    kind: TargetKind,
+    target: str,
+    results: list[PluginResult],
+    started_at: datetime,
+    elapsed: float,
+) -> str:
+    total_found = sum(len(item.found) for item in results)
+    lines: list[str] = [
+        "# OSINT-отчёт",
+        "",
+        f"- Цель: `{target}`",
+        f"- Тип: {kind.title}",
+        f"- Начало: {started_at.strftime('%Y-%m-%d %H:%M:%S %Z')}",
+        f"- Длительность: {human_duration(elapsed)}",
+        f"- Модулей: {len(results)}",
+        f"- Находок: {total_found}",
+        "",
+        "---",
+        "",
+    ]
+
+    for result in results:
+        lines.append(f"## {result.title}")
+        lines.append("")
+        status = "ok" if result.ok else "ошибка"
+        lines.append(f"Модуль: `{result.plugin}` · статус: {status} · время: {result.elapsed:.1f} с")
+        lines.append("")
+        if result.errors:
+            lines.append("Ошибки:")
+            for error in result.errors:
+                lines.append(f"- {error}")
+            lines.append("")
+        if result.findings:
+            lines.append("| Источник | Статус | Ссылка | Детали |")
+            lines.append("| --- | --- | --- | --- |")
+            for finding in result.findings:
+                url = f"[{_short(finding.url)}]({finding.url})" if finding.url else "—"
+                details = (finding.details or "—").replace("|", "\\|").replace("\n", " ")
+                source = finding.source.replace("|", "\\|")
+                lines.append(f"| {source} | {finding.status} | {url} | {details} |")
+        else:
+            lines.append("Ничего не найдено.")
+        lines.append("")
+
+    lines.append("---")
+    lines.append("")
+    lines.append("Отчёт собран автоматически из открытых источников.")
+    return "\n".join(lines)
+
+
+def _short(url: str | None, limit: int = 60) -> str:
+    if not url:
+        return "—"
+    return url if len(url) <= limit else f"{url[: limit - 1]}…"
+
+
+def summary_text(results: list[PluginResult]) -> str:
+    lines: list[str] = []
+    for result in results:
+        if not result.ok:
+            reason = result.errors[0] if result.errors else "неизвестная ошибка"
+            lines.append(f"— {result.title}: ошибка ({reason})")
+            continue
+        lines.append(
+            f"— {result.title}: найдено {len(result.found)} из {result.checked}, {result.elapsed:.1f} с"
+        )
+    return "\n".join(lines) or "Нет данных."
+
+
+def write_report(
+    kind: TargetKind,
+    target: str,
+    markdown: str,
+    report_dir: Path,
+    stamp: datetime,
+) -> Path:
+    report_dir.mkdir(parents=True, exist_ok=True)
+    name = f"{stamp.strftime('%Y%m%d-%H%M%S')}_{kind.value}_{safe_filename(target)}.md"
+    path = report_dir / name
+    path.write_text(markdown, encoding="utf-8")
+    return path
+
+
+================================================================================
+ФАЙЛ: bot\core\runner.py
+================================================================================
+
+from __future__ import annotations
+
+import asyncio
+import time
+from typing import Awaitable, Callable
+
+from bot.core.plugin import OSINTPlugin, PluginResult
+
+ProgressCallback = Callable[[PluginResult, int, int], Awaitable[None]]
+
+
+class Runner:
+    def __init__(self, max_concurrent: int = 4) -> None:
+        self._sem = asyncio.Semaphore(max(1, max_concurrent))
+
+    async def run_many(
+        self,
+        plugins: list[OSINTPlugin],
+        target: str,
+        on_done: ProgressCallback | None = None,
+    ) -> list[PluginResult]:
+        total = len(plugins)
+        counter = {"done": 0}
+
+        async def run_one(plugin: OSINTPlugin) -> PluginResult:
+            async with self._sem:
+                started = time.perf_counter()
+                result: PluginResult
+                try:
+                    result = await asyncio.wait_for(plugin.run(target), timeout=plugin.default_timeout)
+                except asyncio.TimeoutError:
+                    result = PluginResult(plugin=plugin.name, title=plugin.title, target=target, ok=False)
+                    result.errors.append(f"превышен таймаут {plugin.default_timeout} с")
+                except Exception as exc:  # noqa: BLE001
+                    result = PluginResult(plugin=plugin.name, title=plugin.title, target=target, ok=False)
+                    result.errors.append(f"{type(exc).__name__}: {exc}")
+                result.elapsed = time.perf_counter() - started
+                counter["done"] += 1
+                if on_done is not None:
+                    try:
+                        await on_done(result, counter["done"], total)
+                    except Exception:  # noqa: BLE001
+                        pass
+                return result
+
+        return list(await asyncio.gather(*(run_one(plugin) for plugin in plugins)))
+
+
+================================================================================
+ФАЙЛ: bot\core\storage.py
+================================================================================
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
+
+import aiosqlite
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS queries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    username TEXT,
+    kind TEXT NOT NULL,
+    target TEXT NOT NULL,
+    plugins TEXT NOT NULL,
+    found INTEGER NOT NULL DEFAULT 0,
+    elapsed REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'ok'
+);
+CREATE INDEX IF NOT EXISTS idx_queries_created ON queries (created_at DESC);
+"""
+
+
+class Storage:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._db: aiosqlite.Connection | None = None
+
+    async def connect(self) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._db = await aiosqlite.connect(self._path)
+        await self._db.executescript(SCHEMA)
+        await self._db.commit()
+
+    async def close(self) -> None:
+        if self._db is not None:
+            await self._db.close()
+            self._db = None
+
+    def _conn(self) -> aiosqlite.Connection:
+        if self._db is None:
+            raise RuntimeError("storage is not connected")
+        return self._db
+
+    async def log_query(
+        self,
+        *,
+        user_id: int,
+        username: str | None,
+        kind: str,
+        target: str,
+        plugins: str,
+        found: int,
+        elapsed: float,
+        status: str = "ok",
+    ) -> None:
+        db = self._conn()
+        await db.execute(
+            "INSERT INTO queries (created_at, user_id, username, kind, target, plugins, found, elapsed, status)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                user_id,
+                username,
+                kind,
+                target,
+                plugins,
+                found,
+                elapsed,
+                status,
+            ),
+        )
+        await db.commit()
+
+    async def recent(self, limit: int = 20) -> list[tuple]:
+        db = self._conn()
+        cursor = await db.execute(
+            "SELECT created_at, user_id, username, kind, target, found, elapsed, status"
+            " FROM queries ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return list(rows)
+
+    async def stats(self, user_id: int) -> tuple[int, int]:
+        db = self._conn()
+        cursor = await db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(found), 0) FROM queries WHERE user_id = ?",
+            (user_id,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return (int(row[0]), int(row[1])) if row else (0, 0)
+
+
+================================================================================
+ФАЙЛ: bot\core\utils.py
+================================================================================
+
+from __future__ import annotations
+
+import re
+import unicodedata
+
+from bot.core.plugin import TargetKind
+
+USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+DOMAIN_RE = re.compile(
+    r"^(?=.{4,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))+$"
+)
+EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[A-Za-z0-9.-]{3,255}$")
+URL_RE = re.compile(r"^https?://[^\s/$.?#].[^\s]*$", re.IGNORECASE)
+
+
+def _clean(raw: str) -> str:
+    value = unicodedata.normalize("NFKC", raw or "").strip()
+    return value.strip("`'\"<>()[] ")
+
+
+def to_username(raw: str) -> tuple[bool, str, str]:
+    value = _clean(raw)
+    if "://" in value:
+        value = value.rstrip("/").rsplit("/", 1)[-1]
+    value = value.lstrip("@")
+    value = value.split("?", 1)[0]
+    if not USERNAME_RE.match(value):
+        return False, value, "username: только буквы, цифры, точка, дефис, подчёркивание (до 64 символов)"
+    return True, value, ""
+
+
+def to_email(raw: str) -> tuple[bool, str, str]:
+    value = _clean(raw).lower()
+    if not EMAIL_RE.match(value):
+        return False, value, "email: формат name@example.com"
+    return True, value, ""
+
+
+def to_domain(raw: str) -> tuple[bool, str, str]:
+    value = _clean(raw).lower()
+    if "://" in value:
+        value = value.split("://", 1)[1]
+    value = value.split("/", 1)[0].split("@")[-1].split(":", 1)[0]
+    if value.startswith("www."):
+        value = value[4:]
+    if not DOMAIN_RE.match(value):
+        return False, value, "домен: формат example.com"
+    return True, value, ""
+
+
+def to_url(raw: str) -> tuple[bool, str, str]:
+    value = _clean(raw)
+    if not value:
+        return False, value, "url: пустая строка"
+    if "://" not in value:
+        value = f"https://{value}"
+    if not URL_RE.match(value):
+        return False, value, "url: формат https://example.com/page"
+    return True, value, ""
+
+
+def to_ip(raw: str) -> tuple[bool, str, str]:
+    import ipaddress
+
+    value = _clean(raw)
+    try:
+        return True, str(ipaddress.ip_address(value)), ""
+    except ValueError:
+        return False, value, "ip: формат 8.8.8.8 или 2001:db8::1"
+
+
+def to_phone(raw: str) -> tuple[bool, str, str]:
+    value = _clean(raw)
+    digits = re.sub(r"[^\d]", "", value)
+    if value.startswith("+"):
+        digits = "+" + digits
+    if digits.startswith("8") and len(digits) == 11:
+        digits = "+7" + digits[1:]
+    elif digits.startswith("7") and len(digits) == 11:
+        digits = "+" + digits
+    elif not digits.startswith("+") and len(digits) == 10:
+        digits = "+7" + digits
+    digits = digits.replace("+", "")
+    if not digits.isdigit() or not 10 <= len(digits) <= 15:
+        return False, value, "телефон: формат +79991234567"
+    return True, "+" + digits, ""
+
+
+_NORMALIZERS = {
+    TargetKind.USERNAME: to_username,
+    TargetKind.EMAIL: to_email,
+    TargetKind.DOMAIN: to_domain,
+    TargetKind.URL: to_url,
+    TargetKind.IP: to_ip,
+    TargetKind.PHONE: to_phone,
+}
+
+
+def normalize(kind: TargetKind, raw: str) -> tuple[bool, str, str]:
+    return _NORMALIZERS[kind](raw)
+
+
+def detect_kind(raw: str) -> TargetKind:
+    import ipaddress
+
+    value = _clean(raw)
+    if value.startswith(("http://", "https://")):
+        return TargetKind.URL
+    if "@" in value and "." in value.split("@", 1)[-1]:
+        return TargetKind.EMAIL
+    try:
+        ipaddress.ip_address(value)
+        return TargetKind.IP
+    except ValueError:
+        pass
+    if re.fullmatch(r"\+?\d[\d\s\-()]{8,}", value):
+        return TargetKind.PHONE
+    if DOMAIN_RE.match(value.lower().split("/", 1)[0]):
+        return TargetKind.DOMAIN
+    return TargetKind.USERNAME
+
+
+def chunk(text: str, size: int = 3800) -> list[str]:
+    if len(text) <= size:
+        return [text]
+    parts: list[str] = []
+    current: list[str] = []
+    length = 0
+    for line in text.splitlines(keepends=True):
+        while len(line) > size:
+            parts.append(line[:size])
+            line = line[size:]
+        if length + len(line) > size:
+            parts.append("".join(current))
+            current, length = [], 0
+        current.append(line)
+        length += len(line)
+    if current:
+        parts.append("".join(current))
+    return parts
+
+
+def human_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f} с"
+    minutes, rest = divmod(int(seconds), 60)
+    return f"{minutes} мин {rest} с"
+
+
+def safe_filename(value: str, limit: int = 40) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-.")
+    return (cleaned or "target")[:limit]
+
+
+================================================================================
+ФАЙЛ: bot\keyboards.py
+================================================================================
+
+from __future__ import annotations
+
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+
+def kinds_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Имя пользователя", callback_data="kind:username"),
+                InlineKeyboardButton(text="Email", callback_data="kind:email"),
+            ],
+            [
+                InlineKeyboardButton(text="Домен", callback_data="kind:domain"),
+                InlineKeyboardButton(text="URL / архивы", callback_data="kind:url"),
+            ],
+            [InlineKeyboardButton(text="Состояние модулей", callback_data="plugins:list")],
+        ]
+    )
+
+
+================================================================================
+ФАЙЛ: bot\main.py
+================================================================================
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from datetime import datetime, timezone
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    BotCommand,
+    CallbackQuery,
+    ErrorEvent,
+    FSInputFile,
+    Message,
+)
+
+from bot.config import settings
+from bot.core import net
+from bot.core.access import AccessMiddleware, cooldown
+from bot.core.plugin import REGISTRY, TargetKind, plugins_for
+from bot.core.report import build_markdown, summary_text, write_report
+from bot.core.runner import Runner
+from bot.core.storage import Storage
+from bot.core.utils import chunk, detect_kind, human_duration, normalize
+from bot.keyboards import kinds_keyboard
+from bot.plugins import load_plugins
+
+log = logging.getLogger(__name__)
+
+router = Router()
+runner = Runner(settings.max_concurrent_jobs)
+storage: Storage | None = None
+
+WELCOME = (
+    "OSINT-бот: сбор только из открытых источников.\n\n"
+    "Что умеет:\n"
+    "— проверять имя пользователя по базе площадок (Maigret, BlackBird);\n"
+    "— искать email среди сервисов (BlackBird);\n"
+    "— собирать DNS и поддомены по домену (crt.sh);\n"
+    "— находить сохранённые копии страниц в веб-архивах "
+    "(Wayback Machine, archive.today, Memento, Common Crawl).\n\n"
+    "Команды:\n"
+    "/scan <тип> <цель> — полный скан, тип: username, email, domain, url\n"
+    "/archives <url> — только веб-архивы\n"
+    "/plugins — какие модули доступны\n"
+    "/stats — ваша статистика\n"
+    "/cancel — сбросить выбор\n\n"
+    "Выберите тип цели:"
+)
+
+
+class ScanForm(StatesGroup):
+    waiting_target = State()
+
+
+def _db() -> Storage:
+    if storage is None:
+        raise RuntimeError("storage is not initialised")
+    return storage
+
+
+@router.message(CommandStart())
+async def cmd_start(message: Message) -> None:
+    await message.answer(WELCOME, reply_markup=kinds_keyboard())
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message) -> None:
+    await message.answer(WELCOME, reply_markup=kinds_keyboard())
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Состояние сброшено.", reply_markup=kinds_keyboard())
+
+
+@router.message(Command("plugins"))
+async def cmd_plugins(message: Message) -> None:
+    await message.answer(await _plugins_report())
+
+
+@router.callback_query(F.data == "plugins:list")
+async def cb_plugins(callback: CallbackQuery) -> None:
+    await callback.message.answer(await _plugins_report())
+    await callback.answer()
+
+
+async def _plugins_report() -> str:
+    if not REGISTRY:
+        return "Модули не загружены."
+    lines: list[str] = ["Модули:"]
+    for plugin in REGISTRY.values():
+        ready, note = await plugin.ready()
+        state_text = "готов" if ready else f"недоступен — {note}"
+        kinds = ", ".join(kind.value for kind in plugin.input_types)
+        lines.append(f"— {plugin.title} [{plugin.name}]: {state_text} (типы: {kinds})")
+    return "\n".join(lines)
+
+
+@router.callback_query(F.data.startswith("kind:"))
+async def cb_kind(callback: CallbackQuery, state: FSMContext) -> None:
+    raw = (callback.data or "").split(":", 1)[-1]
+    try:
+        kind = TargetKind(raw)
+    except ValueError:
+        await callback.answer("Неизвестный тип", show_alert=True)
+        return
+    await state.set_state(ScanForm.waiting_target)
+    await state.update_data(kind=kind.value)
+    await callback.message.answer(f"{kind.title}: пришлите цель одним сообщением.")
+    await callback.answer()
+
+
+@router.message(ScanForm.waiting_target, F.text)
+async def got_target(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    await state.clear()
+    try:
+        kind = TargetKind(data.get("kind", "username"))
+    except ValueError:
+        kind = TargetKind.USERNAME
+    await scan_and_reply(message, kind, (message.text or "").strip())
+
+
+@router.message(Command("scan"))
+async def cmd_scan(message: Message, command: CommandObject) -> None:
+    args = (command.args or "").strip()
+    if not args:
+        await message.answer("Формат: /scan username vasya или /scan domain example.com")
+        return
+    parts = args.split(maxsplit=1)
+    if len(parts) == 1:
+        kind = detect_kind(parts[0])
+        await scan_and_reply(message, kind, parts[0])
+        return
+    raw_kind, target = parts
+    try:
+        kind = TargetKind(raw_kind.lower())
+    except ValueError:
+        await message.answer("Тип цели: username, email, domain или url.")
+        return
+    await scan_and_reply(message, kind, target.strip())
+
+
+@router.message(Command("archives"))
+async def cmd_archives(message: Message, command: CommandObject) -> None:
+    target = (command.args or "").strip()
+    if not target:
+        await message.answer("Формат: /archives https://example.com/page")
+        return
+    await scan_and_reply(message, TargetKind.URL, target, only={"archives"})
+
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message) -> None:
+    total, found = await _db().stats(message.from_user.id)
+    await message.answer(f"Запросов: {total}\nВсего находок: {found}")
+
+
+@router.message(Command("log"))
+async def cmd_log(message: Message) -> None:
+    if not settings.is_admin(message.from_user.id):
+        await message.answer("Команда только для администратора.")
+        return
+    rows = await _db().recent(20)
+    if not rows:
+        await message.answer("Журнал пуст.")
+        return
+    lines = ["Последние запросы:"]
+    for created, user_id, username, kind, target, found, elapsed, status in rows:
+        who = username or user_id
+        lines.append(f"{created} · {who} · {kind} · {target} · находок {found} · {elapsed:.0f} с · {status}")
+    for part in chunk("\n".join(lines)):
+        await message.answer(part)
+
+
+@router.message(F.text)
+async def free_text(message: Message) -> None:
+    raw = (message.text or "").strip()
+    if raw.startswith("/"):
+        return
+    await scan_and_reply(message, detect_kind(raw), raw)
+
+
+@router.errors()
+async def on_error(event: ErrorEvent) -> bool:
+    log.error("ошибка обработки обновления", exc_info=event.exception)
+    message = event.update.message
+    if message is not None:
+        try:
+            await message.answer("Не получилось обработать запрос. Попробуйте ещё раз.")
+        except Exception:  # noqa: BLE001
+            pass
+    return True
+
+
+async def scan_and_reply(
+    message: Message,
+    kind: TargetKind,
+    raw: str,
+    only: set[str] | None = None,
+) -> None:
+    user = message.from_user
+    if user is None:
+        return
+    wait = cooldown.check(user.id)
+    if wait:
+        await message.answer(f"Слишком часто. Подождите {wait} с.")
+        return
+
+    ok, target, error = normalize(kind, raw)
+    if not ok:
+        await message.answer(f"Неверная цель — {error}")
+        return
+
+    candidates = [plugin for plugin in plugins_for(kind) if only is None or plugin.name in only]
+    if not candidates:
+        await message.answer("Для этого типа цели нет модулей.")
+        return
+
+    active = []
+    skipped: list[str] = []
+    for plugin in candidates:
+        ready, note = await plugin.ready()
+        if ready:
+            active.append(plugin)
+        else:
+            skipped.append(f"{plugin.title}: {note}")
+
+    if not active:
+        await message.answer("Нет доступных модулей:\n" + "\n".join(skipped))
+        return
+
+    started_at = datetime.now(timezone.utc)
+    status = await message.answer(f"Сканирую: {target}\nТип: {kind.title}\nМодулей: {len(active)}")
+    began = time.perf_counter()
+
+    async def on_done(result, done: int, total: int) -> None:
+        try:
+            await status.edit_text(
+                f"{done}/{total} готово: {result.title}\nЦель: {target}"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    results = await runner.run_many(active, target, on_done)
+    elapsed = time.perf_counter() - began
+    found_total = sum(len(result.found) for result in results)
+
+    markdown = build_markdown(kind, target, results, started_at, elapsed)
+    path = write_report(kind, target, markdown, settings.report_dir, started_at)
+
+    summary = summary_text(results)
+    head = f"Готово за {human_duration(elapsed)}. Находок: {found_total}."
+    if skipped:
+        head += "\nНе запущены:\n" + "\n".join(skipped)
+    body = f"{head}\n\n{summary}"
+    try:
+        await status.edit_text(body[:4000])
+    except Exception:  # noqa: BLE001
+        await message.answer(body[:4000])
+
+    try:
+        await message.answer_document(
+            FSInputFile(path), caption=f"{kind.title}: {target} · находок {found_total}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("не удалось отправить отчёт: %s", exc)
+        await message.answer(f"Отчёт сохранён: {path}")
+
+    await _db().log_query(
+        user_id=user.id,
+        username=user.username,
+        kind=kind.value,
+        target=target,
+        plugins=",".join(plugin.name for plugin in active),
+        found=found_total,
+        elapsed=elapsed,
+    )
+
+
+async def _set_commands(bot: Bot) -> None:
+    await bot.set_my_commands(
+        [
+            BotCommand(command="start", description="меню"),
+            BotCommand(command="scan", description="скан: /scan username vasya"),
+            BotCommand(command="archives", description="поиск в веб-архивах"),
+            BotCommand(command="plugins", description="доступные модули"),
+            BotCommand(command="stats", description="моя статистика"),
+            BotCommand(command="cancel", description="сбросить выбор"),
+        ]
+    )
+
+
+async def main() -> None:
+    global storage
+    if not settings.token:
+        raise SystemExit("BOT_TOKEN не задан. Заполните .env (см. .env.example).")
+
+    settings.ensure_dirs()
+    storage = Storage(settings.db_path)
+    await storage.connect()
+    load_plugins()
+
+    bot = Bot(settings.token, default=DefaultBotProperties())
+    dispatcher = Dispatcher(storage=MemoryStorage())
+    dispatcher.message.middleware(AccessMiddleware())
+    dispatcher.callback_query.middleware(AccessMiddleware())
+    dispatcher.include_router(router)
+
+    try:
+        await _set_commands(bot)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("не удалось обновить список команд: %s", exc)
+    log.info("модулей загружено: %s", ", ".join(REGISTRY) or "нет")
+    try:
+        await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
+    finally:
+        await net.close()
+        await storage.close()
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    asyncio.run(main())
+
+
+================================================================================
+ФАЙЛ: bot\plugins\__init__.py
+================================================================================
+
+from __future__ import annotations
+
+import importlib
+import pkgutil
+
+from bot.core.plugin import REGISTRY, OSINTPlugin
+
+
+def load_plugins() -> dict[str, OSINTPlugin]:
+    for module in pkgutil.iter_modules(__path__):
+        if module.name.startswith("_"):
+            continue
+        importlib.import_module(f"{__name__}.{module.name}")
+    return dict(REGISTRY)
+
+
+__all__ = ["load_plugins", "REGISTRY"]
+
+
+================================================================================
+ФАЙЛ: bot\plugins\archives_plugin.py
+================================================================================
+
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+import time
+from urllib.parse import quote, urlparse
+
+from bot.core import net
+from bot.core.plugin import Finding, OSINTPlugin, PluginResult, TargetKind, register
+
+MEMENTO_RE = re.compile(r'<([^>]+)>;\s*rel="([^"]+)"(?:;\s*datetime="([^"]*)")?')
+CC_CACHE: dict[str, object] = {"ts": 0.0, "index": None}
+CC_TTL = 12 * 3600
+
+
+def _fmt_ts(timestamp: str) -> str:
+    digits = "".join(ch for ch in timestamp if ch.isdigit())
+    if len(digits) >= 14:
+        return f"{digits[0:4]}-{digits[4:6]}-{digits[6:8]} {digits[8:10]}:{digits[10:12]}"
+    if len(digits) >= 8:
+        return f"{digits[0:4]}-{digits[4:6]}-{digits[6:8]}"
+    return timestamp or "—"
+
+
+def parse_cdx(payload: object) -> list[Finding]:
+    if not payload:
+        return []
+    rows = payload
+    if isinstance(rows, str):
+        try:
+            rows = json.loads(rows)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(rows, list) or len(rows) < 2:
+        return []
+    header = [str(item) for item in rows[0]]
+    findings: list[Finding] = []
+    for row in rows[1:]:
+        record = dict(zip(header, row))
+        original = str(record.get("original") or "").strip()
+        timestamp = str(record.get("timestamp") or "").strip()
+        status = str(record.get("statuscode") or "").strip()
+        if not original:
+            continue
+        findings.append(
+            Finding(
+                source="Wayback Machine",
+                status="found",
+                url=f"https://web.archive.org/web/{timestamp}/{original}",
+                details=f"{_fmt_ts(timestamp)} · HTTP {status or '—'}",
+            )
+        )
+    return findings
+
+
+def parse_memento(text: str) -> list[Finding]:
+    findings: list[Finding] = []
+    seen: set[str] = set()
+    for match in MEMENTO_RE.finditer(text or ""):
+        url, rel, datetime = match.group(1), match.group(2), match.group(3) or ""
+        if rel not in ("memento", "first memento"):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        host = urlparse(url).netloc.lower()
+        findings.append(
+            Finding(
+                source=f"Архив: {host}",
+                status="found",
+                url=url,
+                details=_fmt_ts(datetime) if datetime else None,
+            )
+        )
+    return findings
+
+
+def parse_commoncrawl(text: str) -> list[Finding]:
+    findings: list[Finding] = []
+    seen: set[str] = set()
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        url = str(record.get("url") or "")
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        findings.append(
+            Finding(
+                source="Common Crawl",
+                status="found",
+                url=url,
+                details=f"{_fmt_ts(str(record.get('timestamp', '')))} · HTTP {record.get('status', '—')}",
+            )
+        )
+    return findings
+
+
+async def _cc_index() -> str | None:
+    now = time.time()
+    cached = CC_CACHE.get("index")
+    if cached and now - float(CC_CACHE.get("ts") or 0) < CC_TTL:
+        return str(cached)
+    data, error = await net.get_json("https://index.commoncrawl.org/collinfo.json", timeout=20)
+    if error or not isinstance(data, list) or not data:
+        return None
+    index = str(data[0].get("id") or "")
+    if index:
+        CC_CACHE.update({"ts": now, "index": index})
+        return index
+    return None
+
+
+class ArchivesPlugin(OSINTPlugin):
+    name = "archives"
+    title = "Веб-архивы (Wayback, archive.today, Memento, Common Crawl)"
+    description = "Ищет сохранённые копии страницы в крупнейших веб-архивах."
+    input_types = (TargetKind.URL, TargetKind.DOMAIN)
+    default_timeout = 90
+
+    async def run(self, target: str) -> PluginResult:
+        result = PluginResult(plugin=self.name, title=self.title, target=target)
+        base = target if target.startswith("http") else f"https://{target}"
+        encoded = quote(base, safe="")
+
+        wayback, archive_today, memento, commoncrawl = await asyncio.gather(
+            self._wayback(base, encoded),
+            self._archive_today(base),
+            self._memento(base),
+            self._commoncrawl(encoded),
+        )
+
+        for part, source_name in (
+            (wayback, "Wayback"),
+            (archive_today, "archive.today"),
+            (memento, "Memento"),
+            (commoncrawl, "Common Crawl"),
+        ):
+            findings, error = part
+            result.findings.extend(findings)
+            if error:
+                result.errors.append(f"{source_name}: {error}")
+
+        if not result.findings and not result.errors:
+            result.errors.append("в архивах ничего не найдено")
+        if not result.findings and result.errors and all(
+            "ничего не найдено" in item for item in result.errors
+        ):
+            result.ok = True
+        return result
+
+    async def _wayback(self, base: str, encoded: str) -> tuple[list[Finding], str]:
+        data, error = await net.get_json(
+            "https://web.archive.org/cdx/search/cdx"
+            f"?url={encoded}&output=json&limit=-25&fl=timestamp,original,statuscode"
+            "&collapse=urlkey&filter=statuscode:200",
+            timeout=30,
+        )
+        if error:
+            return [], f"CDX недоступен ({error})"
+        findings = parse_cdx(data)
+        if findings:
+            return findings[:10], ""
+        data, error = await net.get_json(
+            f"https://archive.org/wayback/available?url={encoded}", timeout=20
+        )
+        if error or not isinstance(data, dict):
+            return [], "" if not error else f"availability API: {error}"
+        closest = (data.get("archived_snapshots") or {}).get("closest") or {}
+        url = closest.get("url")
+        if url:
+            return [
+                Finding(
+                    source="Wayback Machine",
+                    status="found",
+                    url=str(url),
+                    details=_fmt_ts(str(closest.get("timestamp", ""))),
+                )
+            ], ""
+        return [], ""
+
+    async def _archive_today(self, base: str) -> tuple[list[Finding], str]:
+        status, location, error = await net.head_status(
+            f"https://archive.ph/newest/{base}", timeout=20
+        )
+        if error:
+            return [], error
+        if status in (301, 302, 303, 307, 308) and location:
+            url = location if location.startswith("http") else f"https://archive.ph{location}"
+            return [Finding(source="archive.today", status="found", url=url)], ""
+        if status == 200:
+            return [Finding(source="archive.today", status="found", url=f"https://archive.ph/newest/{base}")], ""
+        if status == 404:
+            return [], ""
+        return [], f"HTTP {status}"
+
+    async def _memento(self, base: str) -> tuple[list[Finding], str]:
+        text, error = await net.get_text(
+            f"https://timetravel.mementoweb.org/timemap/link/{base}", timeout=25
+        )
+        if error:
+            return [], f"агрегатор недоступен ({error})"
+        return parse_memento(text)[:10], ""
+
+    async def _commoncrawl(self, encoded: str) -> tuple[list[Finding], str]:
+        index = await _cc_index()
+        if not index:
+            return [], "индекс недоступен"
+        text, error = await net.get_text(
+            f"https://index.commoncrawl.org/{index}?url={encoded}&output=json&limit=5", timeout=30
+        )
+        if error:
+            return [], error
+        return parse_commoncrawl(text), ""
+
+
+register(ArchivesPlugin())
+
+
+================================================================================
+ФАЙЛ: bot\plugins\blackbird_plugin.py
+================================================================================
+
+from __future__ import annotations
+
+import asyncio
+import re
+from urllib.parse import urlparse
+
+from bot.config import settings
+from bot.core.cli import find_binary, run_cli, split_command
+from bot.core.plugin import Finding, OSINTPlugin, PluginResult, TargetKind, register
+
+URL_RE = re.compile(r"https?://[^\s'\"<>]+")
+CSV_HINTS = ("site", "url", "status", "found")
+
+
+def _source_from_url(url: str) -> str:
+    host = urlparse(url).netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host or url
+
+
+def parse_blackbird(text: str) -> list[Finding]:
+    findings: list[Finding] = []
+    seen: set[str] = set()
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        lowered = line.lower()
+
+        parts = [part.strip().strip('"') for part in line.split(",")]
+        if len(parts) >= 2 and "url" not in lowered and "," in line:
+            site, url_part = parts[0], parts[1]
+            status = parts[2] if len(parts) > 2 else ""
+            if url_part.startswith("http") and url_part not in seen:
+                seen.add(url_part)
+                findings.append(
+                    Finding(
+                        source=site or _source_from_url(url_part),
+                        status="found" if "not" not in status.lower() else "not_found",
+                        url=url_part,
+                        details=status or None,
+                    )
+                )
+                continue
+
+        for url in URL_RE.findall(line):
+            url = url.rstrip(".,;)")
+            if url in seen:
+                continue
+            seen.add(url)
+            findings.append(
+                Finding(
+                    source=_source_from_url(url),
+                    status="found",
+                    url=url,
+                    details=None if "not found" not in lowered else "помечено как not found",
+                )
+            )
+    return findings
+
+
+class BlackbirdPlugin(OSINTPlugin):
+    name = "blackbird"
+    title = "BlackBird — ник и email по площадкам"
+    description = "Обёртка над CLI BlackBird (p1ngul1n0/blackbird): аккаунты по username и email."
+    input_types = (TargetKind.USERNAME, TargetKind.EMAIL)
+    requires_binary = "blackbird"
+    default_timeout = settings.blackbird_timeout
+
+    async def ready(self) -> tuple[bool, str]:
+        if not settings.blackbird_cmd:
+            return False, (
+                "не настроен: скачайте репозиторий p1ngul1n0/blackbird и укажите в .env "
+                "BLACKBIRD_CMD=python путь/к/blackbird.py"
+            )
+        parts = split_command(settings.blackbird_cmd)
+        if not parts or find_binary(parts[0]) is None:
+            return False, f"команда не найдена: {settings.blackbird_cmd}"
+        return True, ""
+
+    async def run(self, target: str) -> PluginResult:
+        result = PluginResult(plugin=self.name, title=self.title, target=target)
+        is_email = "@" in target
+        cmd = split_command(settings.blackbird_cmd) + (["-e", target] if is_email else ["-u", target])
+        cmd += split_command(settings.blackbird_args)
+        try:
+            code, stdout, stderr = await run_cli(cmd, timeout=max(30, self.default_timeout - 15))
+        except asyncio.TimeoutError:
+            result.ok = False
+            result.errors.append(f"BlackBird не уложился в {self.default_timeout} с")
+            return result
+        except FileNotFoundError:
+            result.ok = False
+            result.errors.append("команда BlackBird не найдена")
+            return result
+
+        result.findings = parse_blackbird("\n".join((stdout, stderr)))
+        if not result.findings:
+            result.ok = False
+            tail = (stderr or stdout).strip().splitlines()[-3:]
+            result.errors.append(
+                "BlackBird не вернул распознанных результатов"
+                + (f": {' / '.join(tail)}" if tail else "")
+            )
+        elif code != 0 and not result.found:
+            result.errors.append(f"BlackBird завершился с кодом {code}, находок нет")
+        return result
+
+
+register(BlackbirdPlugin())
+
+
+================================================================================
+ФАЙЛ: bot\plugins\domains_plugin.py
+================================================================================
+
+from __future__ import annotations
+
+import asyncio
+import json
+import socket
+from urllib.parse import quote
+
+from bot.core import net
+from bot.core.plugin import Finding, OSINTPlugin, PluginResult, TargetKind, register
+
+MAX_SUBDOMAINS = 40
+
+
+def parse_crtsh(text: str) -> list[Finding]:
+    try:
+        data = json.loads(text) if text.strip().startswith("[") else []
+    except json.JSONDecodeError:
+        return []
+    findings: list[Finding] = []
+    seen: set[str] = set()
+    for record in data:
+        if not isinstance(record, dict):
+            continue
+        names = str(record.get("name_value") or "").splitlines()
+        issuer = str(record.get("issuer_name") or "")
+        issued = str(record.get("not_before") or "")[:10]
+        for name in names:
+            host = name.strip().lower().lstrip("*.")
+            if not host or host in seen:
+                continue
+            seen.add(host)
+            details = " · ".join(part for part in (issued, issuer[:60]) if part)
+            findings.append(
+                Finding(source="crt.sh", status="found", url=f"https://{host}", details=details or None)
+            )
+            if len(findings) >= MAX_SUBDOMAINS:
+                return findings
+    return findings
+
+
+async def _dns_records(domain: str) -> tuple[list[Finding], str]:
+    try:
+        loop = asyncio.get_running_loop()
+        infos = await asyncio.wait_for(
+            loop.getaddrinfo(domain, None, type=socket.SOCK_STREAM), timeout=8
+        )
+        addresses = sorted({info[4][0] for info in infos})
+    except (socket.gaierror, asyncio.TimeoutError, OSError) as exc:
+        return [], f"A/AAAA: {type(exc).__name__}"
+
+    findings = [
+        Finding(source="DNS", status="found", details=f"A/AAAA: {address}") for address in addresses
+    ]
+
+    try:
+        import dns.asyncresolver  # type: ignore
+    except ImportError:
+        return findings, ""
+
+    resolver = dns.asyncresolver.Resolver()
+    resolver.timeout = 5
+    resolver.lifetime = 8
+    for record_type in ("MX", "NS", "TXT"):
+        try:
+            answer = await resolver.resolve(domain, record_type)
+            for item in answer:
+                findings.append(
+                    Finding(source="DNS", status="found", details=f"{record_type}: {str(item)[:120]}")
+                )
+        except Exception:  # noqa: BLE001
+            continue
+    return findings, ""
+
+
+class DomainsPlugin(OSINTPlugin):
+    name = "domains"
+    title = "Домен: DNS и сертификаты (crt.sh)"
+    description = "Собирает DNS-записи и поддомены из публичных логов Certificate Transparency."
+    input_types = (TargetKind.DOMAIN,)
+    default_timeout = 75
+
+    async def run(self, target: str) -> PluginResult:
+        result = PluginResult(plugin=self.name, title=self.title, target=target)
+        dns_findings, dns_error = await _dns_records(target)
+        result.findings.extend(dns_findings)
+        if dns_error:
+            result.errors.append(dns_error)
+
+        text, error = await net.get_text(
+            f"https://crt.sh/?q={quote('%25.' + target)}&output=json", timeout=45
+        )
+        if error:
+            result.errors.append(f"crt.sh: {error}")
+        else:
+            subdomains = parse_crtsh(text)
+            result.findings.extend(subdomains)
+            if not subdomains:
+                result.errors.append("crt.sh: сертификатов не найдено")
+
+        if not result.findings:
+            result.ok = False
+            result.errors.append("домен не разрешается и нет публичных сертификатов")
+        return result
+
+
+register(DomainsPlugin())
+
+
+================================================================================
+ФАЙЛ: bot\plugins\maigret_plugin.py
+================================================================================
+
+from __future__ import annotations
+
+import asyncio
+import json
+
+from bot.config import settings
+from bot.core.cli import find_binary, run_cli, split_command
+from bot.core.plugin import Finding, OSINTPlugin, PluginResult, TargetKind, register
+
+FOUND_MARKERS = ("claimed", "found", "taken", "exists", "present", "used", "registered")
+MISSING_MARKERS = ("available", "not found", "free", "absent", "vacant", "unavailable")
+
+
+def parse_maigret(stdout: str) -> list[Finding]:
+    findings: list[Finding] = []
+    seen: set[tuple[str, str]] = set()
+    for raw_line in stdout.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(item, dict):
+            continue
+        site = str(item.get("sitename") or item.get("site") or item.get("site_name") or "").strip()
+        if not site:
+            continue
+        url = item.get("url_user") or item.get("url") or item.get("url_main") or ""
+        status = item.get("status", "")
+        if isinstance(status, dict):
+            status = status.get("status") or status.get("ids") or ""
+        status_text = str(status).strip()
+        lowered = status_text.lower()
+        is_missing = any(marker in lowered for marker in MISSING_MARKERS)
+        is_found = bool(url) or any(marker in lowered for marker in FOUND_MARKERS)
+        if is_missing and not any(marker in lowered for marker in FOUND_MARKERS):
+            key = (site, "not_found")
+            if key not in seen:
+                seen.add(key)
+                findings.append(Finding(source=site, status="not_found", details=status_text or None))
+        elif is_found:
+            key = (site, "found")
+            if key not in seen:
+                seen.add(key)
+                findings.append(
+                    Finding(source=site, status="found", url=str(url) or None, details=status_text or None)
+                )
+    return findings
+
+
+class MaigretPlugin(OSINTPlugin):
+    name = "maigret"
+    title = "Maigret — ник по базе площадок"
+    description = "Обёртка над CLI maigret: ищет профили по имени пользователя на тысячах сайтов."
+    input_types = (TargetKind.USERNAME,)
+    requires_binary = "maigret"
+    default_timeout = settings.maigret_timeout
+
+    async def ready(self) -> tuple[bool, str]:
+        parts = split_command(settings.maigret_cmd)
+        if not parts or find_binary(parts[0]) is None:
+            return False, "не установлен: pip install maigret"
+        return True, ""
+
+    async def run(self, target: str) -> PluginResult:
+        result = PluginResult(plugin=self.name, title=self.title, target=target)
+        cmd = split_command(settings.maigret_cmd) + [
+            target,
+            "--json",
+            "ndjson",
+            "--no-progressbar",
+            "--no-color",
+            "--timeout",
+            "10",
+        ]
+        cmd += split_command(settings.maigret_args)
+        try:
+            code, stdout, stderr = await run_cli(cmd, timeout=max(30, self.default_timeout - 15))
+        except asyncio.TimeoutError:
+            result.ok = False
+            result.errors.append(f"maigret не уложился в {self.default_timeout} с")
+            return result
+        except FileNotFoundError:
+            result.ok = False
+            result.errors.append("команда maigret не найдена в PATH")
+            return result
+
+        result.findings = parse_maigret(stdout)
+        if not result.findings:
+            result.ok = False
+            tail = (stderr or stdout).strip().splitlines()[-3:]
+            result.errors.append("пустой ответ maigret" + (f": {' / '.join(tail)}" if tail else ""))
+        elif code != 0 and not result.found:
+            result.errors.append(f"maigret завершился с кодом {code}, находок нет")
+        return result
+
+
+register(MaigretPlugin())
+
+
+================================================================================
+ФАЙЛ: bot\plugins\profiles_plugin.py
+================================================================================
+
+from __future__ import annotations
+
+import asyncio
+
+from bot.core import net
+from bot.core.plugin import Finding, OSINTPlugin, PluginResult, TargetKind, register
+
+
+def parse_github(data: object) -> Finding | None:
+    if not isinstance(data, dict) or not data.get("login"):
+        return None
+    details = ", ".join(
+        part
+        for part in (
+            data.get("name"),
+            data.get("company"),
+            f"репозиториев: {data.get('public_repos')}" if data.get("public_repos") is not None else "",
+            f"подписчиков: {data.get('followers')}" if data.get("followers") is not None else "",
+            f"создан: {str(data.get('created_at', ''))[:10]}" if data.get("created_at") else "",
+        )
+        if part
+    )
+    return Finding(
+        source="GitHub",
+        status="found",
+        url=str(data.get("html_url") or ""),
+        details=details or None,
+    )
+
+
+def parse_gitlab(data: object) -> Finding | None:
+    if not isinstance(data, list) or not data:
+        return None
+    user = data[0]
+    if not isinstance(user, dict):
+        return None
+    details = ", ".join(
+        part
+        for part in (
+            user.get("name"),
+            f"проектов: {user.get('projects_count')}" if user.get("projects_count") is not None else "",
+            f"создан: {str(user.get('created_at', ''))[:10]}" if user.get("created_at") else "",
+        )
+        if part
+    )
+    return Finding(
+        source="GitLab",
+        status="found",
+        url=str(user.get("web_url") or ""),
+        details=details or None,
+    )
+
+
+def parse_reddit(data: object) -> Finding | None:
+    if not isinstance(data, dict):
+        return None
+    payload = data.get("data")
+    if not isinstance(payload, dict) or payload.get("is_suspended"):
+        return None
+    name = payload.get("name")
+    if not name:
+        return None
+    details = []
+    if payload.get("total_karma") is not None:
+        details.append(f"карма: {payload.get('total_karma')}")
+    if payload.get("created_utc"):
+        import datetime
+
+        created = datetime.datetime.fromtimestamp(float(payload["created_utc"]), datetime.timezone.utc)
+        details.append(f"создан: {created:%Y-%m-%d}")
+    return Finding(
+        source="Reddit",
+        status="found",
+        url=f"https://www.reddit.com/user/{name}",
+        details=", ".join(details) or None,
+    )
+
+
+def parse_hn(data: object) -> Finding | None:
+    if not isinstance(data, dict) or not data.get("id"):
+        return None
+    import datetime
+
+    details = []
+    if data.get("karma") is not None:
+        details.append(f"карма: {data.get('karma')}")
+    if data.get("created"):
+        created = datetime.datetime.fromtimestamp(float(data["created"]), datetime.timezone.utc)
+        details.append(f"создан: {created:%Y-%m-%d}")
+    return Finding(
+        source="Hacker News",
+        status="found",
+        url=f"https://news.ycombinator.com/user?id={data['id']}",
+        details=", ".join(details) or None,
+    )
+
+
+def parse_keybase(data: object) -> Finding | None:
+    if not isinstance(data, dict):
+        return None
+    them = data.get("them")
+    if not isinstance(them, list) or not them:
+        return None
+    user = them[0]
+    if not isinstance(user, dict):
+        return None
+    profile = user.get("profile") or {}
+    details = ", ".join(
+        part
+        for part in (
+            profile.get("full_name"),
+            profile.get("location"),
+            f"подтверждений: {user.get('proofs_summary', {}).get('all')}"
+            if isinstance(user.get("proofs_summary"), dict)
+            else "",
+        )
+        if part
+    )
+    return Finding(
+        source="Keybase",
+        status="found",
+        url=f"https://keybase.io/{user.get('username', '')}",
+        details=details or None,
+    )
+
+
+SOURCES = (
+    ("GitHub", "https://api.github.com/users/{target}", parse_github),
+    ("GitLab", "https://gitlab.com/api/v4/users?username={target}", parse_gitlab),
+    ("Reddit", "https://www.reddit.com/user/{target}/about.json", parse_reddit),
+    ("Hacker News", "https://hacker-news.firebaseio.com/v0/user/{target}.json", parse_hn),
+    (
+        "Keybase",
+        "https://keybase.io/_/api/1.0/user/lookup.json?username={target}",
+        parse_keybase,
+    ),
+)
+
+
+class ProfilesPlugin(OSINTPlugin):
+    name = "profiles"
+    title = "Профили по нику (GitHub, GitLab, Reddit, HN, Keybase)"
+    description = "Проверяет ник через открытые API площадок."
+    input_types = (TargetKind.USERNAME,)
+    default_timeout = 45
+
+    async def run(self, target: str) -> PluginResult:
+        result = PluginResult(plugin=self.name, title=self.title, target=target)
+
+        async def check(name: str, template: str, parser) -> tuple[list[Finding], str]:
+            status, data, error = await net.get_json_status(
+                template.format(target=target), timeout=15
+            )
+            if status == 404:
+                return [], ""
+            if status == 0:
+                return [], f"{name}: {error}"
+            if status != 200:
+                return [], f"{name}: {error}"
+            finding = parser(data)
+            return ([finding] if finding else []), ""
+
+        outcomes = await asyncio.gather(*(check(*source) for source in SOURCES))
+        for findings, error in outcomes:
+            result.findings.extend(findings)
+            if error:
+                result.errors.append(error)
+
+        if not result.findings and not result.errors:
+            result.errors.append("профили не найдены")
+        return result
+
+
+register(ProfilesPlugin())
+
+
+================================================================================
+ФАЙЛ: deploy\deploy.sh
+================================================================================
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+if [ "$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)" -lt 2048 ] && ! swapon --show | grep -q .; then
+    echo "Мало RAM, создаю swap 2G..."
+    sudo fallocate -l 2G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=2048
+    sudo chmod 600 /swapfile
+    sudo mkswap /swapfile
+    sudo swapon /swapfile
+    grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+fi
+
+if [ ! -f .env ]; then
+    echo "Ошибка: нет .env. Скопируйте .env.example и впишите BOT_TOKEN." >&2
+    exit 1
+fi
+
+if ! grep -q '^BOT_TOKEN=[0-9]\{5,\}:' .env; then
+    echo "Ошибка: BOT_TOKEN в .env не заполнен или не похож на токен." >&2
+    exit 1
+fi
+
+if ! command -v docker >/dev/null 2>&1; then
+    echo "Docker не найден, ставлю..."
+    sudo apt-get update
+    sudo apt-get install -y docker.io
+    sudo systemctl enable --now docker
+fi
+
+if docker compose version >/dev/null 2>&1; then
+    COMPOSE="docker compose"
+elif command -v docker-compose >/dev/null 2>&1; then
+    COMPOSE="docker-compose"
+else
+    echo "Ставлю compose..."
+    sudo apt-get install -y docker-compose-v2 || sudo apt-get install -y docker-compose
+    COMPOSE="docker compose"
+fi
+
+sudo $COMPOSE up -d --build
+sudo $COMPOSE ps
+echo
+echo "Готово. Смотрите лог: sudo $COMPOSE logs -f"
+
+
+================================================================================
+ФАЙЛ: DEPLOY.md
+================================================================================
+
+# Развёртывание на VPS
+
+Боту нужен сервер с исходящим доступом к `api.telegram.org`. Входящие порты открывать не
+нужно: бот сам ходит в Telegram (long polling), никаких доменов и SSL.
+
+Минимальная конфигурация: 1 vCPU, 1 ГБ RAM, Ubuntu 22.04/24.04, 10 ГБ диска.
+
+## 1. Сервер
+
+Подойдёт любой VPS. Варианты:
+
+- **Oracle Cloud Always Free** — бесплатный ARM-инстанс, нужна карта для верификации.
+- **Hetzner CX22** — около 4 €/мес.
+- **Timeweb / Beget / Aeza** — от 150–300 ₽/мес, оплата картой РФ.
+
+При создании выберите Ubuntu 24.04 и добавьте свой SSH-ключ (или получите пароль root
+в письме).
+
+## 2. Загрузка проекта
+
+С локальной машины:
+
+```powershell
+scp -r .\osint-bot root@<IP>:/opt/osint-bot
+```
+
+Если проект в git-репозитории — на сервере:
+
+```bash
+apt-get update && apt-get install -y git
+git clone <URL> /opt/osint-bot
+```
+
+## 3. Настройка
+
+На сервере:
+
+```bash
+cd /opt/osint-bot
+cp .env.example .env
+nano .env
+```
+
+Заполните минимум:
+
+```
+BOT_TOKEN=ваш_токен
+ALLOWED_USER_IDS=ваш_telegram_id
+ADMIN_IDS=ваш_telegram_id
+```
+
+`ALLOWED_USER_IDS` обязателен: пустое значение делает бота открытым для всех.
+
+## 4. Запуск
+
+```bash
+cd /opt/osint-bot
+chmod +x deploy/deploy.sh
+./deploy/deploy.sh
+```
+
+Скрипт поставит Docker при необходимости, соберёт образ и поднимет контейнер.
+Проверка:
+
+```bash
+sudo docker compose logs -f
+```
+
+В логе должно быть:
+
+```
+INFO bot.main: модулей загружено: archives, blackbird, domains, maigret
+INFO aiogram.dispatcher: Start polling
+```
+
+После этого `/start` в Telegram отвечает.
+
+## 5. Автозапуск после перезагрузки
+
+```bash
+sudo cp deploy/osint-bot.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now osint-bot
+```
+
+Проверка: `systemctl status osint-bot`.
+
+## 6. Обновление
+
+```bash
+cd /opt/osint-bot
+git pull            # если через git
+./deploy/deploy.sh
+```
+
+## 7. Данные
+
+- `reports/` — markdown-отчёты (монтируется в контейнер).
+- `data/bot.sqlite3` — журнал запросов.
+- `.env` — секреты, в образ не попадает (исключён в `.dockerignore`).
+
+Бэкап: `tar czf backup.tgz reports data .env`.
+
+## Если не стартует
+
+```bash
+sudo docker compose logs --tail=100
+```
+
+- `BOT_TOKEN не задан` — проверьте `.env`, он должен лежать рядом с `docker-compose.yml`.
+- `TelegramNetworkError` — сервер не видит `api.telegram.org`; проверьте исходящий доступ.
+- `Conflict: terminated by other getUpdates` — где-то запущен второй экземпляр бота
+  (например, локально). Остановите его.
+
+## Модули после установки
+
+`archives` и `domains` работают сразу. Для `maigret`:
+
+```bash
+sudo docker compose exec bot pip install maigret
+```
+
+либо соберите образ с `INSTALL_MAIGRET: "1"` в `docker-compose.yml`.
+Для `blackbird` укажите в `.env` путь к скрипту внутри контейнера.
+
+## Вариант без сервера: GitHub Actions (бесплатно)
+
+Бот живёт на раннерах GitHub: бесплатно для публичных репозиториев, 4 ядра и 16 ГБ RAM,
+`maigret` устанавливается на лету, `blackbird` тоже влезает.
+
+Как это работает: workflow `.github/workflows/bot.yml` запускается по расписанию каждые
+6 часов и держит процесс 340 минут. Между запусками пауза 10–20 минут; сообщения не теряются,
+Telegram отдаёт их при переподключении.
+
+Настройка:
+
+1. Создайте публичный репозиторий на GitHub и загрузите туда папку проекта.
+2. Settings → Secrets and variables → Actions → New repository secret:
+   `BOT_TOKEN`, `ALLOWED_USER_IDS`, `ADMIN_IDS`.
+3. Вкладка Actions → workflow `osint-bot` → Run workflow.
+
+Ограничения: отчёты и SQLite между запусками не сохраняются; через 60 дней без коммитов
+GitHub отключает расписание — достаточно нажать Run workflow.
+
+
+================================================================================
+ФАЙЛ: docker-compose.yml
+================================================================================
+
+services:
+  bot:
+    build:
+      context: .
+      args:
+        INSTALL_MAIGRET: "0"
+    env_file:
+      - .env
+    volumes:
+      - ./reports:/app/reports
+      - ./data:/app/data
+    restart: unless-stopped
+    stop_grace_period: 20s
+
+
+================================================================================
+ФАЙЛ: folder_dump.txt
+================================================================================
+
+
+
+================================================================================
+ФАЙЛ: main.py
+================================================================================
+
+from __future__ import annotations
+
+import asyncio
+import logging
+
+from bot.main import main
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+
+
+================================================================================
+ФАЙЛ: read_folder.py
+================================================================================
+
+﻿import os, sys, argparse
+from pathlib import Path
+
+CODE_EXTENSIONS = {'.py','.js','.ts','.jsx','.tsx','.java','.c','.cpp','.cc','.cxx','.h','.hpp','.cs','.go','.rs','.rb','.php','.html','.htm','.css','.scss','.sass','.less','.json','.yaml','.yml','.toml','.ini','.cfg','.md','.txt','.sh','.bash','.zsh','.sql','.xml','.kt','.swift','.m','.mm','.pl','.lua','.r','.vue','.svelte'}
+SKIP_DIRS = {'.git','.svn','.hg','node_modules','__pycache__','.venv','venv','env','.env','dist','build','target','bin','obj','.idea','.vscode','.mypy_cache','.pytest_cache','.tox','coverage','.next','.nuxt'}
+MAX_FILE_SIZE = 1024*1024
+
+def is_binary(p):
+    try:
+        with open(p,'rb') as f: chunk=f.read(1024)
+        if b'\x00' in chunk: return True
+        chunk.decode('utf-8'); return False
+    except (UnicodeDecodeError,OSError): return True
+
+def collect_files(root, exts, max_size):
+    files=[]
+    for dp,dn,fn in os.walk(root):
+        dn[:]=[d for d in dn if d not in SKIP_DIRS and not d.startswith('.')]
+        for name in fn:
+            p=Path(dp)/name
+            if p.suffix.lower() not in exts: continue
+            try:
+                if p.stat().st_size>max_size: continue
+            except OSError: continue
+            if is_binary(p): continue
+            files.append(p)
+    return sorted(files)
+
+def read_file(p):
+    try:
+        with open(p,'r',encoding='utf-8',errors='replace') as f: return f.read()
+    except OSError as e: return f'<<Ошибка чтения: {e}>>'
+
+def main():
+    ap=argparse.ArgumentParser()
+    ap.add_argument('root',nargs='?',default='.')
+    ap.add_argument('-o','--output')
+    ap.add_argument('-e','--ext',action='append')
+    ap.add_argument('--max-size',type=int,default=MAX_FILE_SIZE)
+    ap.add_argument('--list',action='store_true')
+    a=ap.parse_args()
+    root=Path(a.root).resolve()
+    if not root.is_dir(): print(f'Ошибка: {root} не папка',file=sys.stderr); sys.exit(1)
+    exts=set(CODE_EXTENSIONS)
+    if a.ext:
+        for e in a.ext: exts.add(e if e.startswith('.') else '.'+e)
+    files=collect_files(root,exts,a.max_size)
+    if not files: print('Файлы не найдены.',file=sys.stderr); sys.exit(0)
+    out=open(a.output,'w',encoding='utf-8') if a.output else sys.stdout
+    try:
+        if a.list:
+            for f in files: print(f.relative_to(root),file=out)
+        else:
+            for f in files:
+                print(f"\n{'='*80}",file=out); print(f'ФАЙЛ: {f.relative_to(root)}',file=out); print(f"{'='*80}\n",file=out); print(read_file(f),file=out)
+    finally:
+        if a.output: out.close(); print(f'Сохранено: {a.output}',file=sys.stderr)
+
+if __name__=='__main__': main()
+
+
+================================================================================
+ФАЙЛ: requirements.txt
+================================================================================
+
+aiogram>=3.15,<4
+aiohttp>=3.10
+aiosqlite>=0.20
+dnspython>=2.6
+
+
+================================================================================
+ФАЙЛ: run.py
+================================================================================
+
+from __future__ import annotations
+
+import asyncio
+import logging
+
+from aiogram.exceptions import TelegramNetworkError
+
+from bot.main import main
+
+log = logging.getLogger("run")
+
+
+async def _loop() -> None:
+    delay = 5
+    while True:
+        try:
+            await main()
+            return
+        except TelegramNetworkError as exc:
+            log.warning("нет связи с Telegram API (%s). Повтор через %s с.", exc, delay)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("бот остановился с ошибкой: %s", exc)
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 60)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    try:
+        asyncio.run(_loop())
+    except KeyboardInterrupt:
+        print("остановлено")
+
+
+================================================================================
+ФАЙЛ: tools\check_token.py
+================================================================================
+
+from __future__ import annotations
+
+import asyncio
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from aiogram import Bot  # noqa: E402
+
+from bot.config import settings  # noqa: E402
+from bot.core.plugin import REGISTRY  # noqa: E402
+from bot.plugins import load_plugins  # noqa: E402
+
+
+async def main() -> int:
+    load_plugins()
+    print(f"модулей: {len(REGISTRY)}")
+    for plugin in REGISTRY.values():
+        ready, note = await plugin.ready()
+        print(f"  {plugin.name}: {'готов' if ready else 'недоступен'} {note if not ready else ''}".rstrip())
+
+    if not settings.token:
+        print("BOT_TOKEN пуст")
+        return 1
+
+    bot = Bot(settings.token)
+    try:
+        me = await bot.get_me()
+        print(f"токен валиден: @{me.username} (id {me.id})")
+    except Exception as exc:  # noqa: BLE001
+        print(f"токен не принят: {type(exc).__name__}: {exc}")
+        return 1
+    finally:
+        await bot.session.close()
+
+    if not settings.allowed_ids:
+        print("внимание: ALLOWED_USER_IDS пуст — бот открыт всем")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(asyncio.run(main()))
+
+
+================================================================================
+ФАЙЛ: tools\selftest.py
+================================================================================
+
+from __future__ import annotations
+
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from bot.core.plugin import Finding, PluginResult, TargetKind  # noqa: E402
+from bot.core.report import build_markdown, summary_text  # noqa: E402
+from bot.core.utils import chunk, detect_kind, normalize  # noqa: E402
+from bot.plugins.archives_plugin import (  # noqa: E402
+    parse_cdx,
+    parse_commoncrawl,
+    parse_memento,
+)
+from bot.plugins.blackbird_plugin import parse_blackbird  # noqa: E402
+from bot.plugins.domains_plugin import parse_crtsh  # noqa: E402
+from bot.plugins.maigret_plugin import parse_maigret  # noqa: E402
+
+CHECKS: list[tuple[str, bool, str]] = []
+
+
+def check(name: str, condition: bool, detail: str = "") -> None:
+    CHECKS.append((name, bool(condition), detail))
+
+
+def main() -> int:
+    ok, value, _ = normalize(TargetKind.USERNAME, "https://github.com/octocat/")
+    check("username из URL", ok and value == "octocat", value)
+
+    ok, value, _ = normalize(TargetKind.USERNAME, "@octo_cat")
+    check("username с @", ok and value == "octo_cat", value)
+
+    ok, value, _ = normalize(TargetKind.EMAIL, "  User@Example.COM ")
+    check("email нормализация", ok and value == "user@example.com", value)
+
+    ok, value, _ = normalize(TargetKind.DOMAIN, "https://www.Example.com/path?x=1")
+    check("домен из URL", ok and value == "example.com", value)
+
+    ok, value, _ = normalize(TargetKind.URL, "example.com/page")
+    check("url без схемы", ok and value == "https://example.com/page", value)
+
+    ok, _, _ = normalize(TargetKind.USERNAME, "плохой ник!")
+    check("отказ на неверном username", not ok)
+
+    check("detect email", detect_kind("a@b.ru") is TargetKind.EMAIL)
+    check("detect url", detect_kind("https://x.dev") is TargetKind.URL)
+    check("detect domain", detect_kind("sub.example.com") is TargetKind.DOMAIN)
+    check("detect username", detect_kind("just_nick") is TargetKind.USERNAME)
+
+    parts = chunk("a" * 50 + "\n" + "b" * 50, size=60)
+    check("chunk режет длинный текст", len(parts) >= 2 and all(len(p) <= 60 for p in parts))
+
+    maigret_sample = "\n".join(
+        [
+            '{"sitename": "GitHub", "url_user": "https://github.com/octocat", "status": {"status": "Claimed"}}',
+            '{"sitename": "Reddit", "url_user": null, "status": {"status": "Available"}}',
+            "not a json line",
+        ]
+    )
+    findings = parse_maigret(maigret_sample)
+    check("maigret: found", any(f.source == "GitHub" and f.status == "found" for f in findings))
+    check("maigret: not_found", any(f.source == "Reddit" and f.status == "not_found" for f in findings))
+
+    blackbird_sample = "\n".join(
+        [
+            "[+] GitHub: https://github.com/octocat",
+            "site,url,status",
+            "Reddit,https://reddit.com/user/octocat,Found",
+            "[*] Email: test@example.com",
+        ]
+    )
+    bb = parse_blackbird(blackbird_sample)
+    check("blackbird: url", any(f.url == "https://github.com/octocat" for f in bb))
+    check("blackbird: csv", any(f.source == "Reddit" for f in bb))
+
+    cdx = [["timestamp", "original", "statuscode"], ["20200101120000", "example.com", "200"]]
+    cdx_findings = parse_cdx(cdx)
+    check(
+        "cdx",
+        len(cdx_findings) == 1
+        and cdx_findings[0].url == "https://web.archive.org/web/20200101120000/example.com",
+        str(cdx_findings),
+    )
+
+    memento = (
+        '<https://web.archive.org/web/2020/http://example.com>; rel="memento"; '
+        'datetime="2020-01-01T12:00:00Z"'
+    )
+    check("memento", len(parse_memento(memento)) == 1)
+
+    cc = '{"url": "http://example.com", "timestamp": "20200101120000", "status": "200"}'
+    check("commoncrawl", len(parse_commoncrawl(cc)) == 1)
+
+    crt = '[{"name_value": "www.example.com\\nexample.com", "issuer_name": "CA", "not_before": "2024-01-01T00:00:00"}]'
+    check("crt.sh", len(parse_crtsh(crt)) == 2)
+
+    results = [
+        PluginResult(
+            plugin="demo",
+            title="Demo",
+            target="example.com",
+            findings=[
+                Finding(source="src", status="found", url="https://example.com", details="ok"),
+                Finding(source="src2", status="not_found"),
+            ],
+            elapsed=1.2,
+        )
+    ]
+    markdown = build_markdown(TargetKind.DOMAIN, "example.com", results, datetime.now(timezone.utc), 1.5)
+    check("report: markdown", "# OSINT-отчёт" in markdown and "Demo" in markdown)
+    check("report: summary", "найдено 1 из 2" in summary_text(results))
+
+    failed = [item for item in CHECKS if not item[1]]
+    for name, passed, detail in CHECKS:
+        status = "OK  " if passed else "FAIL"
+        suffix = f" ({detail})" if detail and not passed else ""
+        print(f"{status} {name}{suffix}")
+    print(f"\n{len(CHECKS) - len(failed)}/{len(CHECKS)} проверок пройдено")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+

@@ -73,11 +73,11 @@ class MaigretPlugin(OSINTPlugin):
             "--no-progressbar",
             "--no-color",
             "--timeout",
-            "10",
+            "15",
         ]
         cmd += split_command(settings.maigret_args)
         try:
-            code, stdout, stderr = await run_cli(cmd, timeout=max(30, self.default_timeout - 15))
+            code, stdout, stderr = await run_cli(cmd, timeout=max(60, self.default_timeout - 30))
         except asyncio.TimeoutError:
             result.ok = False
             result.errors.append(f"maigret не уложился в {self.default_timeout} с")

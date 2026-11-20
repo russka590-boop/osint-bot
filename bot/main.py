@@ -238,7 +238,12 @@ async def scan_and_reply(
         return
 
     started_at = datetime.now(timezone.utc)
-    status = await message.answer(f"Сканирую: {target}\nТип: {kind.title}\nМодулей: {len(active)}")
+    hint = "\nПолный скан занимает 10–20 минут." if any(
+        plugin.name == "maigret" for plugin in active
+    ) else ""
+    status = await message.answer(
+        f"Сканирую: {target}\nТип: {kind.title}\nМодулей: {len(active)}{hint}"
+    )
     began = time.perf_counter()
 
     async def on_done(result, done: int, total: int) -> None:
