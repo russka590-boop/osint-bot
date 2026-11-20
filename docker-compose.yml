@@ -1,0 +1,13 @@
+services:
+  bot:
+    build:
+      context: .
+      args:
+        INSTALL_MAIGRET: "0"
+    env_file:
+      - .env
+    volumes:
+      - ./reports:/app/reports
+      - ./data:/app/data
+    restart: unless-stopped
+    stop_grace_period: 20s
