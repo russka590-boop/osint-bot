@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from bot.core.plugin import Finding, OSINTPlugin, PluginResult, TargetKind, register
 
@@ -14,7 +14,15 @@ TYPE_NAMES = {
     "PAGER": "пейджер",
     "UAN": "UAN",
     "VOICEMAIL": "голосовая почта",
+    "UNKNOWN": "неизвестен",
 }
+
+
+def type_name(phonenumbers, number_type: int) -> str:
+    for name, title in TYPE_NAMES.items():
+        if getattr(phonenumbers.PhoneNumberType, name, None) == number_type:
+            return title
+    return "неизвестен"
 
 
 class PhonePlugin(OSINTPlugin):
@@ -33,7 +41,7 @@ class PhonePlugin(OSINTPlugin):
 
     async def run(self, target: str) -> PluginResult:
         import phonenumbers
-        from phonenumbers import carrier, geocoder, timezone
+        from phonenumbers import carrier, geocoder
 
         result = PluginResult(plugin=self.name, title=self.title, target=target)
         try:
@@ -57,11 +65,8 @@ class PhonePlugin(OSINTPlugin):
             f"страна: {phonenumbers.region_code_for_number(number) or '—'}",
             f"оператор: {carrier.name_for_number(number, 'ru') or '—'}",
             f"регион: {geocoder.description_for_number(number, 'ru') or '—'}",
-            f"тип: {TYPE_NAMES.get(phonenumbers.number_type_name(number), '—')}",
+            f"тип: {type_name(phonenumbers, phonenumbers.number_type(number))}",
         ]
-        zones = timezone.time_zones_for_number(number)
-        if zones and zones[0] != "Etc/Unknown":
-            details.append(f"часовой пояс: {', '.join(zones)}")
 
         result.findings.append(
             Finding(
