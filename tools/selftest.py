@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +28,35 @@ CHECKS: list[tuple[str, bool, str]] = []
 
 def check(name: str, condition: bool, detail: str = "") -> None:
     CHECKS.append((name, bool(condition), detail))
+
+
+async def storage_checks() -> None:
+    import tempfile
+
+    from bot.core.storage import Storage
+
+    with tempfile.TemporaryDirectory() as tmp:
+        store = Storage(Path(tmp) / "test.db")
+        await store.connect()
+        is_new, greeted, role = await store.register_user(1, "nick", "Имя")
+        check("storage: новый пользователь", is_new and not greeted and role == "user")
+
+        await store.set_role(1, "trusted")
+        check("storage: роль", await store.get_role(1) == "trusted")
+
+        await store.save_message(
+            chat_id=1, message_id=10, user_id=1, username="nick",
+            kind="text", content="привет", file_id=None,
+        )
+        old_content, edit_id = await store.record_edit(1, 10, "пока")
+        check("storage: правка", old_content == "привет" and edit_id is not None)
+
+        messages = await store.user_messages(1)
+        check("storage: история", bool(messages) and messages[0]["content"] == "пока")
+
+        await store.set_setting("auto_reply", "текст")
+        check("storage: настройка", await store.get_setting("auto_reply") == "текст")
+        await store.close()
 
 
 def main() -> int:
@@ -184,6 +214,8 @@ def main() -> int:
     markdown = build_markdown(TargetKind.DOMAIN, "example.com", results, datetime.now(timezone.utc), 1.5)
     check("report: markdown", "# OSINT-отчёт" in markdown and "Demo" in markdown)
     check("report: summary", "найдено 1 из 2" in summary_text(results))
+
+    asyncio.run(storage_checks())
 
     failed = [item for item in CHECKS if not item[1]]
     for name, passed, detail in CHECKS:

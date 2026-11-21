@@ -10,15 +10,32 @@ from bot.config import settings
 
 Handler = Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]]
 
-DENY_TEXT = "Доступ к боту закрыт. Передайте свой ID администратору."
+DENY_TEXT = "Доступ к боту закрыт. Нажмите /start, чтобы отправить заявку администратору."
+PUBLIC_COMMANDS = ("/start", "/help")
+
+_role_lookup: Callable[[int], Awaitable[str | None]] | None = None
 
 
-def is_allowed(user_id: int) -> bool:
+def bind_roles(lookup: Callable[[int], Awaitable[str | None]]) -> None:
+    global _role_lookup
+    _role_lookup = lookup
+
+
+async def is_allowed(user_id: int) -> bool:
     if settings.is_admin(user_id):
         return True
-    if not settings.allowed_ids:
+    if user_id in settings.allowed_ids:
         return True
-    return user_id in settings.allowed_ids
+    if _role_lookup is not None:
+        try:
+            role = await _role_lookup(user_id)
+        except Exception:  # noqa: BLE001
+            role = None
+        if role == "trusted":
+            return True
+        if role == "banned":
+            return False
+    return not settings.allowed_ids
 
 
 class AccessMiddleware(BaseMiddleware):
@@ -26,8 +43,11 @@ class AccessMiddleware(BaseMiddleware):
         user = data.get("event_from_user")
         if user is None:
             return await handler(event, data)
-        if not is_allowed(user.id):
+        if not await is_allowed(user.id):
             if isinstance(event, Message):
+                command = (event.text or "").split(maxsplit=1)[0].split("@")[0].lower()
+                if command in PUBLIC_COMMANDS:
+                    return await handler(event, data)
                 await event.answer(f"{DENY_TEXT}\nВаш ID: {user.id}")
             elif isinstance(event, CallbackQuery):
                 await event.answer(f"{DENY_TEXT} Ваш ID: {user.id}", show_alert=True)

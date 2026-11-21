@@ -16,12 +16,14 @@ from aiogram.types import (
     CallbackQuery,
     ErrorEvent,
     FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     Message,
 )
 
 from bot.config import settings
 from bot.core import net
-from bot.core.access import AccessMiddleware, cooldown
+from bot.core.access import AccessMiddleware, bind_roles, cooldown
 from bot.core.plugin import REGISTRY, TargetKind, plugins_for
 from bot.core.report import build_markdown, summary_text, write_report
 from bot.core.runner import Runner
@@ -55,6 +57,7 @@ WELCOME = (
     "/plugins — какие модули доступны\n"
     "/stats — ваша статистика\n"
     "/cancel — сбросить выбор\n\n"
+    "Сообщения, отправленные боту, сохраняются для модерации и разбора обращений.\n\n"
     "Выберите тип цели:"
 )
 
@@ -71,6 +74,7 @@ def _db() -> Storage:
 
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
+    await track_user(message)
     await message.answer(WELCOME, reply_markup=kinds_keyboard())
 
 
@@ -226,12 +230,304 @@ async def cmd_log(message: Message) -> None:
         await message.answer(part)
 
 
+def _mention(user) -> str:
+    if user is None:
+        return "—"
+    return f"@{user.username}" if user.username else f"id{user.id}"
+
+
+def _name_of(row: dict) -> str:
+    username = row.get("username")
+    return f"@{username}" if username else f"id{row.get('user_id')}"
+
+
+def _payload(message: Message) -> tuple[str, str | None, str | None]:
+    if message.photo:
+        return "photo", message.caption, message.photo[-1].file_id
+    if message.document:
+        return "document", message.caption, message.document.file_id
+    if message.video:
+        return "video", message.caption, message.video.file_id
+    if message.voice:
+        return "voice", message.caption, message.voice.file_id
+    if message.video_note:
+        return "video_note", None, message.video_note.file_id
+    if message.sticker:
+        return "sticker", None, message.sticker.file_id
+    return "text", message.text or message.caption, None
+
+
+async def _notify_admins(
+    bot: Bot, text: str, reply_markup: InlineKeyboardMarkup | None = None
+) -> None:
+    for admin_id in settings.admin_ids:
+        try:
+            await bot.send_message(admin_id, text[:4000], reply_markup=reply_markup)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("не смог уведомить админа %s: %s", admin_id, exc)
+
+
+async def track_user(message: Message) -> None:
+    user = message.from_user
+    if user is None or settings.is_admin(user.id):
+        return
+    is_new, greeted, _role = await _db().register_user(user.id, user.username, user.first_name)
+    if is_new and settings.admin_ids:
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Выдать доступ", callback_data=f"adm:grant:{user.id}"
+                    ),
+                    InlineKeyboardButton(text="Карточка", callback_data=f"adm:card:{user.id}"),
+                ]
+            ]
+        )
+        await _notify_admins(
+            message.bot,
+            f"Новый пользователь\n{_mention(user)} · {user.first_name or '—'}\nID: {user.id}",
+            keyboard,
+        )
+    if not greeted:
+        auto_reply = await _db().get_setting("auto_reply")
+        if auto_reply:
+            try:
+                await message.answer(auto_reply)
+            except Exception:  # noqa: BLE001
+                pass
+        await _db().mark_greeted(user.id)
+
+
+async def store_message(message: Message) -> None:
+    user = message.from_user
+    if user is None:
+        return
+    kind, content, file_id = _payload(message)
+    await _db().save_message(
+        chat_id=message.chat.id,
+        message_id=message.message_id,
+        user_id=user.id,
+        username=user.username,
+        kind=kind,
+        content=content,
+        file_id=file_id,
+    )
+
+
+async def _user_card(user_id: int) -> str:
+    data = await _db().get_user(user_id)
+    if data is None:
+        return f"Пользователь {user_id} не найден."
+    messages = await _db().user_messages(user_id, 10)
+    lines = [
+        f"{data.get('first_name') or '—'} · {_name_of(data)}",
+        f"ID: {data.get('user_id')}",
+        f"Роль: {data.get('role')}",
+        f"Первый вход: {data.get('created_at')}",
+        f"Активность: {data.get('last_seen')}",
+        "",
+        "Последние сообщения:",
+    ]
+    if not messages:
+        lines.append("— нет")
+    for item in messages:
+        stamp = str(item.get("created_at") or "")[11:16]
+        body = (item.get("content") or f"[{item.get('kind')}]")[:200].replace("\n", " ")
+        mark = " · изменено" if item.get("edited_at") else ""
+        lines.append(f"[{stamp}] {body}{mark}")
+    lines.extend(["", "Удалённые сообщения видны, если бот получил их до удаления."])
+    return "\n".join(lines)
+
+
+async def _resolve_user(arg: str) -> dict | None:
+    cleaned = (arg or "").strip()
+    if not cleaned:
+        return None
+    if cleaned.lstrip("-").isdigit():
+        return await _db().get_user(int(cleaned))
+    return await _db().find_user(cleaned)
+
+
+@router.message(Command("admin"))
+async def cmd_admin(message: Message) -> None:
+    if not settings.is_admin(message.from_user.id):
+        await message.answer("Команда только для администратора.")
+        return
+    users = await _db().list_users(limit=10)
+    lines = [
+        "Админ-панель",
+        "/users [запрос] — список и поиск",
+        "/user <id|@ник> — карточка",
+        "/grant <id|@ник> — выдать доступ",
+        "/revoke <id|@ник> — забрать доступ",
+        "/setreply <текст> — авто-ответ на первое сообщение",
+        "/replyoff — выключить авто-ответ",
+        "",
+        "Последние пользователи:",
+    ]
+    for item in users:
+        lines.append(
+            f"— {_name_of(item)} · {item.get('first_name') or '—'} · {item.get('role')}"
+        )
+    await message.answer("\n".join(lines)[:4000])
+
+
+@router.message(Command("users"))
+async def cmd_users(message: Message, command: CommandObject) -> None:
+    if not settings.is_admin(message.from_user.id):
+        return
+    query = (command.args or "").strip()
+    users = await _db().list_users(query or None, 20)
+    if not users:
+        await message.answer("Никого не нашёл.")
+        return
+    lines = [f"Пользователи ({len(users)}):"]
+    for item in users:
+        lines.append(
+            f"— {_name_of(item)} · {item.get('first_name') or '—'} · "
+            f"{item.get('role')} · {item.get('last_seen')}"
+        )
+    await message.answer("\n".join(lines)[:4000])
+
+
+@router.message(Command("user"))
+async def cmd_user(message: Message, command: CommandObject) -> None:
+    if not settings.is_admin(message.from_user.id):
+        return
+    found = await _resolve_user(command.args or "")
+    if found is None:
+        await message.answer("Формат: /user 123456789 или /user @ник")
+        return
+    await message.answer(await _user_card(int(found["user_id"])))
+
+
+async def _set_role_command(message: Message, command: CommandObject, role: str) -> None:
+    if not settings.is_admin(message.from_user.id):
+        return
+    found = await _resolve_user(command.args or "")
+    if found is None:
+        await message.answer("Кого? Пример: /grant 123456789 или /grant @ник")
+        return
+    await _db().set_role(int(found["user_id"]), role)
+    label = "Доступ выдан" if role == "trusted" else "Доступ отозван"
+    await message.answer(f"{label}: {_name_of(found)} ({found['user_id']})")
+
+
+@router.message(Command("grant"))
+async def cmd_grant(message: Message, command: CommandObject) -> None:
+    await _set_role_command(message, command, "trusted")
+
+
+@router.message(Command("revoke"))
+async def cmd_revoke(message: Message, command: CommandObject) -> None:
+    await _set_role_command(message, command, "user")
+
+
+@router.message(Command("setreply"))
+async def cmd_setreply(message: Message, command: CommandObject) -> None:
+    if not settings.is_admin(message.from_user.id):
+        return
+    text = (command.args or "").strip()
+    if not text:
+        current = await _db().get_setting("auto_reply")
+        await message.answer(f"Авто-ответ: {current}" if current else "Авто-ответ выключен.")
+        return
+    await _db().set_setting("auto_reply", text)
+    await message.answer("Авто-ответ сохранён. Уйдёт один раз — при первом сообщении.")
+
+
+@router.message(Command("replyoff"))
+async def cmd_replyoff(message: Message) -> None:
+    if not settings.is_admin(message.from_user.id):
+        return
+    await _db().set_setting("auto_reply", None)
+    await message.answer("Авто-ответ выключен.")
+
+
+@router.callback_query(F.data.startswith("adm:"))
+async def cb_admin(callback: CallbackQuery) -> None:
+    if not settings.is_admin(callback.from_user.id):
+        await callback.answer("Только для администратора", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    value = parts[2] if len(parts) > 2 else ""
+    if action == "grant":
+        try:
+            target_id = int(value)
+        except ValueError:
+            await callback.answer("Некорректный ID", show_alert=True)
+            return
+        granted = await _db().set_role(target_id, "trusted")
+        await callback.answer("Доступ выдан" if granted else "Пользователь не найден")
+        if granted:
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:  # noqa: BLE001
+                pass
+    elif action == "card":
+        try:
+            target_id = int(value)
+        except ValueError:
+            await callback.answer("Некорректный ID", show_alert=True)
+            return
+        await callback.message.answer(await _user_card(target_id))
+        await callback.answer()
+    elif action == "old":
+        edit = await _db().get_edit(int(value or 0))
+        if edit is None:
+            await callback.answer("Правка не найдена", show_alert=True)
+            return
+        await callback.message.answer(f"Прошлая версия:\n{edit.get('old_content') or '—'}"[:4000])
+        await callback.answer()
+    else:
+        await callback.answer()
+
+
 @router.message(F.text)
 async def free_text(message: Message) -> None:
     raw = (message.text or "").strip()
     if raw.startswith("/"):
         return
+    await track_user(message)
+    await store_message(message)
     await scan_and_reply(message, detect_kind(raw), raw)
+
+
+MEDIA_FILTER = F.photo | F.document | F.video | F.voice | F.video_note | F.sticker
+
+
+@router.message(MEDIA_FILTER)
+async def media_message(message: Message) -> None:
+    await track_user(message)
+    await store_message(message)
+    await message.answer("Медиа сохранено в архив. Для поиска пришлите текст.")
+
+
+@router.edited_message()
+async def on_edited(message: Message) -> None:
+    _kind, content, _file_id = _payload(message)
+    old_content, edit_id = await _db().record_edit(
+        message.chat.id, message.message_id, content
+    )
+    if edit_id is None or not settings.admin_ids:
+        return
+    user = message.from_user
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Показать прошлую версию", callback_data=f"adm:old:{edit_id}"
+                )
+            ]
+        ]
+    )
+    preview = (old_content or "—")[:300]
+    await _notify_admins(
+        message.bot,
+        f"{_mention(user)} изменил сообщение\nБыло: {preview}",
+        keyboard,
+    )
 
 
 @router.errors()
@@ -353,6 +649,7 @@ async def _set_commands(bot: Bot) -> None:
             BotCommand(command="plugins", description="доступные модули"),
             BotCommand(command="stats", description="моя статистика"),
             BotCommand(command="cancel", description="сбросить выбор"),
+            BotCommand(command="admin", description="админ-панель"),
         ]
     )
 
@@ -365,6 +662,7 @@ async def main() -> None:
     settings.ensure_dirs()
     storage = Storage(settings.db_path)
     await storage.connect()
+    bind_roles(storage.get_role)
     load_plugins()
 
     bot = Bot(settings.token, default=DefaultBotProperties())
