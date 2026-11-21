@@ -23,7 +23,7 @@ from aiogram.types import (
 
 from bot.config import settings
 from bot.core import net
-from bot.core.access import AccessMiddleware, bind_roles, cooldown
+from bot.core.access import AccessMiddleware, bind_roles, cooldown, is_allowed
 from bot.core.plugin import REGISTRY, TargetKind, plugins_for
 from bot.core.report import build_markdown, summary_text, write_report
 from bot.core.runner import Runner
@@ -75,11 +75,27 @@ def _db() -> Storage:
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     await track_user(message)
+    user = message.from_user
+    if user is not None and not await is_allowed(user.id):
+        await message.answer(
+            "Доступ к боту закрыт.\n"
+            "Заявка отправлена администратору — ожидайте подтверждения.\n"
+            f"Ваш ID: {user.id}"
+        )
+        return
     await message.answer(WELCOME, reply_markup=kinds_keyboard())
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
+    user = message.from_user
+    if user is not None and not await is_allowed(user.id):
+        await message.answer(
+            "Доступ к боту закрыт.\n"
+            "Нажмите /start, чтобы отправить заявку администратору.\n"
+            f"Ваш ID: {user.id}"
+        )
+        return
     await message.answer(WELCOME, reply_markup=kinds_keyboard())
 
 
