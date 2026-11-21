@@ -12,24 +12,27 @@ ENGINE_TITLES = {
 }
 
 
-def kinds_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="Имя пользователя", callback_data="kind:username"),
-                InlineKeyboardButton(text="Email", callback_data="kind:email"),
-            ],
-            [
-                InlineKeyboardButton(text="Домен", callback_data="kind:domain"),
-                InlineKeyboardButton(text="URL / архивы", callback_data="kind:url"),
-            ],
-            [
-                InlineKeyboardButton(text="IP-адрес", callback_data="kind:ip"),
-                InlineKeyboardButton(text="Телефон", callback_data="kind:phone"),
-            ],
-            [InlineKeyboardButton(text="Состояние модулей", callback_data="plugins:list")],
-        ]
-    )
+def kinds_keyboard(show_admin: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="Имя пользователя", callback_data="kind:username"),
+            InlineKeyboardButton(text="Email", callback_data="kind:email"),
+        ],
+        [
+            InlineKeyboardButton(text="Домен", callback_data="kind:domain"),
+            InlineKeyboardButton(text="URL / архивы", callback_data="kind:url"),
+        ],
+        [
+            InlineKeyboardButton(text="IP-адрес", callback_data="kind:ip"),
+            InlineKeyboardButton(text="Телефон", callback_data="kind:phone"),
+        ],
+        [InlineKeyboardButton(text="Состояние модулей", callback_data="plugins:list")],
+    ]
+    if show_admin:
+        rows.append(
+            [InlineKeyboardButton(text="Админ-панель", callback_data="adm:panel")]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def engines_keyboard(kind: TargetKind) -> InlineKeyboardMarkup:

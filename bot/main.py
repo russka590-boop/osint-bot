@@ -83,7 +83,8 @@ async def cmd_start(message: Message) -> None:
             f"Ваш ID: {user.id}"
         )
         return
-    await message.answer(WELCOME, reply_markup=kinds_keyboard())
+    show_admin = bool(user and settings.is_admin(user.id))
+    await message.answer(WELCOME, reply_markup=kinds_keyboard(show_admin))
 
 
 @router.message(Command("help"))
@@ -96,13 +97,15 @@ async def cmd_help(message: Message) -> None:
             f"Ваш ID: {user.id}"
         )
         return
-    await message.answer(WELCOME, reply_markup=kinds_keyboard())
+    show_admin = bool(user and settings.is_admin(user.id))
+    await message.answer(WELCOME, reply_markup=kinds_keyboard(show_admin))
 
 
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("Состояние сброшено.", reply_markup=kinds_keyboard())
+    show_admin = bool(message.from_user and settings.is_admin(message.from_user.id))
+    await message.answer("Состояние сброшено.", reply_markup=kinds_keyboard(show_admin))
 
 
 @router.message(Command("plugins"))
@@ -166,7 +169,10 @@ async def cb_mode(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "menu:back")
 async def cb_back(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    await callback.message.answer("Выберите тип цели:", reply_markup=kinds_keyboard())
+    show_admin = settings.is_admin(callback.from_user.id)
+    await callback.message.answer(
+        "Выберите тип цели:", reply_markup=kinds_keyboard(show_admin)
+    )
     await callback.answer()
 
 
@@ -295,8 +301,15 @@ async def track_user(message: Message) -> None:
                     InlineKeyboardButton(
                         text="Выдать доступ", callback_data=f"adm:grant:{user.id}"
                     ),
-                    InlineKeyboardButton(text="Карточка", callback_data=f"adm:card:{user.id}"),
-                ]
+                    InlineKeyboardButton(
+                        text="Забрать доступ", callback_data=f"adm:revoke:{user.id}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Карточка", callback_data=f"adm:card:{user.id}"
+                    )
+                ],
             ]
         )
         await _notify_admins(
@@ -380,29 +393,34 @@ async def _resolve_user(arg: str) -> dict | None:
     return await _db().find_user(cleaned)
 
 
-@router.message(Command("admin"))
-async def cmd_admin(message: Message) -> None:
-    if not settings.is_admin(message.from_user.id):
-        await message.answer("Команда только для администратора.")
-        return
+async def _admin_panel_text() -> str:
     users = await _db().list_users(limit=10)
     lines = [
         "Админ-панель",
         "/users [запрос] — список и поиск",
-        "/user <id|@ник> — карточка",
+        "/user <id|@ник> — карточка с кнопками",
         "/grant <id|@ник> — выдать доступ",
         "/revoke <id|@ник> — забрать доступ",
-        "Кнопки в карточке пользователя делают то же самое",
         "/setreply <текст> — авто-ответ на первое сообщение",
         "/replyoff — выключить авто-ответ",
         "",
         "Последние пользователи:",
     ]
+    if not users:
+        lines.append("— пока никого")
     for item in users:
         lines.append(
             f"— {_name_of(item)} · {item.get('first_name') or '—'} · {item.get('role')}"
         )
-    await message.answer("\n".join(lines)[:4000])
+    return "\n".join(lines)[:4000]
+
+
+@router.message(Command("admin"))
+async def cmd_admin(message: Message) -> None:
+    if not settings.is_admin(message.from_user.id):
+        await message.answer("Команда только для администратора.")
+        return
+    await message.answer(await _admin_panel_text())
 
 
 @router.message(Command("users"))
@@ -486,7 +504,10 @@ async def cb_admin(callback: CallbackQuery) -> None:
     parts = (callback.data or "").split(":")
     action = parts[1] if len(parts) > 1 else ""
     value = parts[2] if len(parts) > 2 else ""
-    if action in ("grant", "revoke"):
+    if action == "panel":
+        await callback.message.answer(await _admin_panel_text())
+        await callback.answer()
+    elif action in ("grant", "revoke"):
         try:
             target_id = int(value)
         except ValueError:
