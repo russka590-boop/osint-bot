@@ -107,19 +107,34 @@ async def cmd_start(message: Message) -> None:
     await message.answer(WELCOME, reply_markup=kinds_keyboard(show_admin))
 
 
+def _privacy_markup(agreed: bool) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text="Скачать JSON", callback_data="privacy:json")]]
+    if agreed:
+        rows.append(
+            [InlineKeyboardButton(text="Отозвать согласие", callback_data="consent:no")]
+        )
+    else:
+        rows.append([InlineKeyboardButton(text="Согласен", callback_data="consent:yes")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _send_privacy(message: Message, user_id: int) -> None:
+    agreed = not settings.is_admin(user_id) and await has_consent(user_id)
+    await message.answer(PRIVACY_TEXT[:4000], reply_markup=_privacy_markup(agreed))
+
+
 @router.message(Command("privacy"))
 async def cmd_privacy(message: Message) -> None:
     user = message.from_user
-    agreed = bool(user and await has_consent(user.id)) and not settings.is_admin(user.id)
-    keyboard_rows = [
-        [InlineKeyboardButton(text="Скачать JSON", callback_data="privacy:json")],
-    ]
-    if not agreed:
-        keyboard_rows.extend(consent_keyboard().inline_keyboard)
-    await message.answer(
-        PRIVACY_TEXT[:4000],
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
-    )
+    if user is None:
+        return
+    await _send_privacy(message, user.id)
+
+
+@router.callback_query(F.data == "privacy:show")
+async def cb_privacy_show(callback: CallbackQuery) -> None:
+    await _send_privacy(callback.message, callback.from_user.id)
+    await callback.answer()
 
 
 @router.callback_query(F.data == "privacy:json")

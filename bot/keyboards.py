@@ -16,7 +16,6 @@ def consent_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Согласен", callback_data="consent:yes")],
-            [InlineKeyboardButton(text="Не согласен", callback_data="consent:no")],
         ]
     )
 
@@ -35,7 +34,10 @@ def kinds_keyboard(show_admin: bool = False) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="IP-адрес", callback_data="kind:ip"),
             InlineKeyboardButton(text="Телефон", callback_data="kind:phone"),
         ],
-        [InlineKeyboardButton(text="Состояние модулей", callback_data="plugins:list")],
+        [
+            InlineKeyboardButton(text="Состояние модулей", callback_data="plugins:list"),
+            InlineKeyboardButton(text="Конфиденциальность", callback_data="privacy:show"),
+        ],
     ]
     if show_admin:
         rows.append(
