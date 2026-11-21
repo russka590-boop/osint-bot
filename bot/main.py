@@ -56,6 +56,7 @@ WELCOME = (
     "/archives <url> — только веб-архивы\n"
     "/plugins — какие модули доступны\n"
     "/stats — ваша статистика\n"
+    "/msg <текст> — написать администратору\n"
     "/cancel — сбросить выбор\n\n"
     "Сообщения, отправленные боту, сохраняются для модерации и разбора обращений.\n\n"
     "Выберите тип цели:"
@@ -78,8 +79,8 @@ async def cmd_start(message: Message) -> None:
     user = message.from_user
     if user is not None and not await is_allowed(user.id):
         await message.answer(
-            "Доступ к боту закрыт.\n"
-            "Заявка отправлена администратору — ожидайте подтверждения.\n"
+            "У вас пока нет доступа.\n"
+            "Напишите /msg ваш текст — заявка уйдёт администратору.\n"
             f"Ваш ID: {user.id}"
         )
         return
@@ -101,9 +102,39 @@ async def cmd_help(message: Message) -> None:
     await message.answer(WELCOME, reply_markup=kinds_keyboard(show_admin))
 
 
+@router.message(Command("msg"))
+async def cmd_msg(message: Message, command: CommandObject) -> None:
+    user = message.from_user
+    if user is None:
+        return
+    text = (command.args or "").strip()
+    if not text:
+        await message.answer("Формат: /msg ваш текст для администратора")
+        return
+    if settings.admin_ids:
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Выдать доступ", callback_data=f"adm:grant:{user.id}"
+                    ),
+                    InlineKeyboardButton(
+                        text="Карточка", callback_data=f"adm:card:{user.id}"
+                    ),
+                ]
+            ]
+        )
+        await _notify_admins(
+            message.bot,
+            f"Сообщение от {_mention(user)} · {user.first_name or '—'}\n"
+            f"ID: {user.id}\n\n{text[:1500]}",
+            keyboard,
+        )
+    await message.answer("Сообщение отправлено администратору.")
+
+
 @router.message(Command("cancel"))
-async def cmd_cancel(message: Message, state: FSMContext) -> None:
-    await state.clear()
+async def cmd_cancel(message: Message, state: FSMContext) -> None:    await state.clear()
     show_admin = bool(message.from_user and settings.is_admin(message.from_user.id))
     await message.answer("Состояние сброшено.", reply_markup=kinds_keyboard(show_admin))
 
@@ -730,6 +761,7 @@ async def _set_commands(bot: Bot) -> None:
             BotCommand(command="archives", description="поиск в веб-архивах"),
             BotCommand(command="plugins", description="доступные модули"),
             BotCommand(command="stats", description="моя статистика"),
+            BotCommand(command="msg", description="написать администратору"),
             BotCommand(command="cancel", description="сбросить выбор"),
             BotCommand(command="admin", description="админ-панель"),
         ]

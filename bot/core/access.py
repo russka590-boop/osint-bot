@@ -10,8 +10,8 @@ from bot.config import settings
 
 Handler = Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]]
 
-DENY_TEXT = "Доступ к боту закрыт. Нажмите /start, чтобы отправить заявку администратору."
-PUBLIC_COMMANDS = ("/start", "/help")
+DENY_TEXT = "Доступ к боту закрыт. Напишите /msg ваш_текст, чтобы отправить заявку администратору."
+PUBLIC_COMMANDS = ("/start", "/help", "/msg")
 
 _role_lookup: Callable[[int], Awaitable[str | None]] | None = None
 
