@@ -19,6 +19,7 @@ from bot.plugins.archives_plugin import (  # noqa: E402
 from bot.plugins.blackbird_plugin import parse_blackbird_json, parse_blackbird_text  # noqa: E402
 from bot.plugins.domains_plugin import parse_crtsh  # noqa: E402
 from bot.plugins.maigret_plugin import parse_maigret  # noqa: E402
+from bot.policy import POLICY_JSON, POLICY_VERSION, PRIVACY_TEXT  # noqa: E402
 from bot.plugins.rdap_plugin import parse_rdap_domain, parse_rdap_ip  # noqa: E402
 from bot.plugins.telegram_plugin import parse_telegram  # noqa: E402
 from bot.plugins.vk_plugin import parse_vk_subscriptions, parse_vk_user  # noqa: E402
@@ -241,6 +242,16 @@ def main() -> int:
     markdown = build_markdown(TargetKind.DOMAIN, "example.com", results, datetime.now(timezone.utc), 1.5)
     check("report: markdown", "# OSINT-отчёт" in markdown and "Demo" in markdown)
     check("report: summary", "найдено 1 из 2" in summary_text(results))
+
+    check(
+        "policy: json",
+        POLICY_JSON.get("version") == POLICY_VERSION
+        and len(POLICY_JSON.get("sections", [])) >= 8,
+    )
+    check(
+        "policy: text",
+        "Политика конфиденциальности" in PRIVACY_TEXT and "152-ФЗ" in PRIVACY_TEXT,
+    )
 
     asyncio.run(storage_checks())
 

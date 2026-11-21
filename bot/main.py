@@ -43,7 +43,7 @@ from bot.keyboards import (
     kinds_keyboard,
 )
 from bot.plugins import load_plugins
-from bot.policy import POLICY_VERSION, PRIVACY_TEXT
+from bot.policy import POLICY_JSON, POLICY_VERSION, PRIVACY_TEXT
 
 log = logging.getLogger(__name__)
 
@@ -111,10 +111,30 @@ async def cmd_start(message: Message) -> None:
 async def cmd_privacy(message: Message) -> None:
     user = message.from_user
     agreed = bool(user and await has_consent(user.id)) and not settings.is_admin(user.id)
+    keyboard_rows = [
+        [InlineKeyboardButton(text="Скачать JSON", callback_data="privacy:json")],
+    ]
+    if not agreed:
+        keyboard_rows.extend(consent_keyboard().inline_keyboard)
     await message.answer(
         PRIVACY_TEXT[:4000],
-        reply_markup=consent_keyboard() if not agreed else None,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
     )
+
+
+@router.callback_query(F.data == "privacy:json")
+async def cb_privacy_json(callback: CallbackQuery) -> None:
+    import json
+
+    path = settings.db_path.parent / "policy.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(POLICY_JSON, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    await callback.message.answer_document(
+        FSInputFile(path), caption=f"Политика конфиденциальности v{POLICY_VERSION}"
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data == "consent:yes")

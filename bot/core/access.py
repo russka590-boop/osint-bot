@@ -73,7 +73,7 @@ class AccessMiddleware(BaseMiddleware):
                 )
                 return None
             if isinstance(event, CallbackQuery):
-                if (event.data or "").startswith("consent:"):
+                if (event.data or "").startswith(("consent:", "privacy:")):
                     return await handler(event, data)
                 await event.answer("Сначала примите политику: /privacy", show_alert=True)
             return None
