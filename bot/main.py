@@ -640,6 +640,24 @@ async def scan_and_reply(
     )
 
 
+STARTUP_TEXT = "Бот снова доступен! Напишите /start, чтобы продолжить."
+
+
+async def notify_startup(bot: Bot) -> None:
+    try:
+        user_ids = await _db().all_user_ids()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("не смог прочитать список пользователей: %s", exc)
+        return
+    log.info("рассылка о запуске: %s получателей", len(user_ids))
+    for user_id in user_ids:
+        try:
+            await bot.send_message(user_id, STARTUP_TEXT)
+        except Exception:  # noqa: BLE001
+            continue
+        await asyncio.sleep(0.05)
+
+
 async def _set_commands(bot: Bot) -> None:
     await bot.set_my_commands(
         [
@@ -676,9 +694,11 @@ async def main() -> None:
     except Exception as exc:  # noqa: BLE001
         log.warning("не удалось обновить список команд: %s", exc)
     log.info("модулей загружено: %s", ", ".join(REGISTRY) or "нет")
+    startup_task = asyncio.create_task(notify_startup(bot))
     try:
         await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
     finally:
+        startup_task.cancel()
         await net.close()
         await storage.close()
         await bot.session.close()

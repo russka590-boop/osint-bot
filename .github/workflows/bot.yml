@@ -16,6 +16,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Восстановить базу
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: bot-data-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            bot-data-
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -36,3 +44,10 @@ jobs:
           MAIGRET_ARGS: "-a"
           MAIGRET_TIMEOUT: "900"
         run: timeout 340m python main.py || true
+
+      - name: Сохранить базу
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: bot-data-${{ github.run_id }}-${{ github.run_attempt }}

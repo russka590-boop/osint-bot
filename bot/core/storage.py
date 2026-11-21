@@ -281,6 +281,13 @@ class Storage:
         await cursor.close()
         return [dict(row) for row in rows]
 
+    async def all_user_ids(self) -> list[int]:
+        db = self._conn()
+        cursor = await db.execute("SELECT user_id FROM users WHERE role != 'banned'")
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return [int(row[0]) for row in rows]
+
     async def get_setting(self, key: str) -> str | None:
         db = self._conn()
         cursor = await db.execute("SELECT value FROM settings WHERE key = ?", (key,))

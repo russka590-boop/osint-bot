@@ -56,6 +56,7 @@ async def storage_checks() -> None:
 
         await store.set_setting("auto_reply", "текст")
         check("storage: настройка", await store.get_setting("auto_reply") == "текст")
+        check("storage: список пользователей", await store.all_user_ids() == [1])
         await store.close()
 
 
