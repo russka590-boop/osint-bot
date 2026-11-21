@@ -108,7 +108,7 @@ async def cmd_start(message: Message) -> None:
 
 
 def _privacy_markup(agreed: bool) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text="Скачать JSON", callback_data="privacy:json")]]
+    rows = [[InlineKeyboardButton(text="Показать JSON", callback_data="privacy:json")]]
     if agreed:
         rows.append(
             [InlineKeyboardButton(text="Отозвать согласие", callback_data="consent:no")]
@@ -141,14 +141,9 @@ async def cb_privacy_show(callback: CallbackQuery) -> None:
 async def cb_privacy_json(callback: CallbackQuery) -> None:
     import json
 
-    path = settings.db_path.parent / "policy.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(POLICY_JSON, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    await callback.message.answer_document(
-        FSInputFile(path), caption=f"Политика конфиденциальности v{POLICY_VERSION}"
-    )
+    payload = json.dumps(POLICY_JSON, ensure_ascii=False, indent=2)
+    for part in chunk(f"Политика v{POLICY_VERSION}, JSON:\n\n{payload}"):
+        await callback.message.answer(part)
     await callback.answer()
 
 
