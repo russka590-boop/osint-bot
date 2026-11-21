@@ -330,6 +330,22 @@ async def store_message(message: Message) -> None:
     )
 
 
+def _card_markup(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Выдать доступ", callback_data=f"adm:grant:{user_id}"
+                ),
+                InlineKeyboardButton(
+                    text="Забрать доступ", callback_data=f"adm:revoke:{user_id}"
+                ),
+            ],
+            [InlineKeyboardButton(text="Карточка", callback_data=f"adm:card:{user_id}")],
+        ]
+    )
+
+
 async def _user_card(user_id: int) -> str:
     data = await _db().get_user(user_id)
     if data is None:
@@ -376,6 +392,7 @@ async def cmd_admin(message: Message) -> None:
         "/user <id|@ник> — карточка",
         "/grant <id|@ник> — выдать доступ",
         "/revoke <id|@ник> — забрать доступ",
+        "Кнопки в карточке пользователя делают то же самое",
         "/setreply <текст> — авто-ответ на первое сообщение",
         "/replyoff — выключить авто-ответ",
         "",
@@ -414,7 +431,8 @@ async def cmd_user(message: Message, command: CommandObject) -> None:
     if found is None:
         await message.answer("Формат: /user 123456789 или /user @ник")
         return
-    await message.answer(await _user_card(int(found["user_id"])))
+    target_id = int(found["user_id"])
+    await message.answer((await _user_card(target_id))[:4000], reply_markup=_card_markup(target_id))
 
 
 async def _set_role_command(message: Message, command: CommandObject, role: str) -> None:
@@ -468,26 +486,35 @@ async def cb_admin(callback: CallbackQuery) -> None:
     parts = (callback.data or "").split(":")
     action = parts[1] if len(parts) > 1 else ""
     value = parts[2] if len(parts) > 2 else ""
-    if action == "grant":
+    if action in ("grant", "revoke"):
         try:
             target_id = int(value)
         except ValueError:
             await callback.answer("Некорректный ID", show_alert=True)
             return
-        granted = await _db().set_role(target_id, "trusted")
-        await callback.answer("Доступ выдан" if granted else "Пользователь не найден")
-        if granted:
-            try:
-                await callback.message.edit_reply_markup(reply_markup=None)
-            except Exception:  # noqa: BLE001
-                pass
+        role = "trusted" if action == "grant" else "user"
+        changed = await _db().set_role(target_id, role)
+        if not changed:
+            await callback.answer("Пользователь не найден", show_alert=True)
+            return
+        label = "Доступ выдан" if action == "grant" else "Доступ отозван"
+        await callback.answer(label)
+        card = (await _user_card(target_id))[:3800]
+        try:
+            await callback.message.answer(
+                f"{label}\n\n{card}", reply_markup=_card_markup(target_id)
+            )
+        except Exception:  # noqa: BLE001
+            pass
     elif action == "card":
         try:
             target_id = int(value)
         except ValueError:
             await callback.answer("Некорректный ID", show_alert=True)
             return
-        await callback.message.answer(await _user_card(target_id))
+        await callback.message.answer(
+            (await _user_card(target_id))[:4000], reply_markup=_card_markup(target_id)
+        )
         await callback.answer()
     elif action == "old":
         edit = await _db().get_edit(int(value or 0))
