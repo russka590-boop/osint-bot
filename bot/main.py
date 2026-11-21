@@ -134,7 +134,8 @@ async def cmd_msg(message: Message, command: CommandObject) -> None:
 
 
 @router.message(Command("cancel"))
-async def cmd_cancel(message: Message, state: FSMContext) -> None:    await state.clear()
+async def cmd_cancel(message: Message, state: FSMContext) -> None:
+    await state.clear()
     show_admin = bool(message.from_user and settings.is_admin(message.from_user.id))
     await message.answer("Состояние сброшено.", reply_markup=kinds_keyboard(show_admin))
 
