@@ -13,6 +13,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
+    BusinessConnection,
     CallbackQuery,
     ErrorEvent,
     FSInputFile,
@@ -666,6 +667,84 @@ async def cb_admin(callback: CallbackQuery) -> None:
         await callback.answer()
 
 
+@router.business_connection()
+async def on_business_connection(connection: BusinessConnection) -> None:
+    owner = connection.user
+    if owner is None or owner.id not in settings.admin_ids:
+        log.info("business connection от не-админа проигнорировано")
+        return
+    await _db().set_setting(
+        f"conn:{connection.id}", str(owner.id) if connection.is_enabled else None
+    )
+    log.info(
+        "business connection %s owner=%s enabled=%s",
+        connection.id,
+        owner.id,
+        connection.is_enabled,
+    )
+
+
+@router.business_message()
+async def on_business_message(message: Message) -> None:
+    if not message.business_connection_id:
+        return
+    owner_raw = await _db().get_setting(f"conn:{message.business_connection_id}")
+    if not owner_raw or int(owner_raw) not in settings.admin_ids:
+        return
+    if message.chat.type != "private":
+        return
+    sender = message.from_user
+    if sender is None or sender.id in settings.admin_ids:
+        return
+    if await _db().get_setting("secretary_enabled") != "1":
+        return
+    text = await _db().get_setting("secretary_text") or SECRETARY_DEFAULT_TEXT
+    try:
+        await message.bot.send_message(
+            message.chat.id,
+            text,
+            business_connection_id=message.business_connection_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("автоответ в business-чате не отправлен: %s", exc)
+
+
+@router.message(Command("secretary"))
+async def cmd_secretary(message: Message, command: CommandObject) -> None:
+    if not settings.is_admin(message.from_user.id):
+        return
+    args = (command.args or "").strip()
+    if not args or args == "status":
+        enabled = await _db().get_setting("secretary_enabled") == "1"
+        text = await _db().get_setting("secretary_text") or SECRETARY_DEFAULT_TEXT
+        await message.answer(
+            f"Режим секретаря: {'включён' if enabled else 'выключен'}\n"
+            f"Автоответ: {text}\n\n"
+            "/secretary on — включить\n"
+            "/secretary off — выключить\n"
+            "/secretary text <текст> — изменить автоответ\n\n"
+            "Подключение: Telegram → Настройки → Telegram Business → Автоматизация чатов."
+        )
+        return
+    if args == "on":
+        await _db().set_setting("secretary_enabled", "1")
+        await message.answer(
+            "Режим секретаря включён. Подключите бота в Telegram Business → Автоматизация чатов."
+        )
+    elif args == "off":
+        await _db().set_setting("secretary_enabled", None)
+        await message.answer("Режим секретаря выключен.")
+    elif args.lower().startswith("text "):
+        text = args[5:].strip()
+        if not text:
+            await message.answer("Формат: /secretary text ваш текст")
+            return
+        await _db().set_setting("secretary_text", text[:1000])
+        await message.answer("Автоответ обновлён.")
+    else:
+        await message.answer("Команды: /secretary on | off | text <текст> | status")
+
+
 @router.message(F.text)
 async def free_text(message: Message) -> None:
     raw = (message.text or "").strip()
@@ -823,6 +902,7 @@ async def scan_and_reply(
 
 
 STARTUP_TEXT = "Бот снова доступен! Напишите /start, чтобы продолжить."
+SECRETARY_DEFAULT_TEXT = "Сейчас я недоступен. Увижу сообщение позже и отвечу."
 
 
 async def notify_startup(bot: Bot) -> None:
