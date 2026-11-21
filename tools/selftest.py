@@ -16,7 +16,7 @@ from bot.plugins.archives_plugin import (  # noqa: E402
     parse_commoncrawl,
     parse_memento,
 )
-from bot.plugins.blackbird_plugin import parse_blackbird  # noqa: E402
+from bot.plugins.blackbird_plugin import parse_blackbird_json, parse_blackbird_text  # noqa: E402
 from bot.plugins.domains_plugin import parse_crtsh  # noqa: E402
 from bot.plugins.maigret_plugin import parse_maigret  # noqa: E402
 from bot.plugins.rdap_plugin import parse_rdap_domain, parse_rdap_ip  # noqa: E402
@@ -89,8 +89,9 @@ def main() -> int:
 
     maigret_sample = "\n".join(
         [
-            '{"sitename": "GitHub", "url_user": "https://github.com/octocat", "status": {"status": "Claimed"}}',
-            '{"sitename": "Reddit", "url_user": null, "status": {"status": "Available"}}',
+            '{"url_user": "https://github.com/octocat", "status": '
+            '{"site_name": "GitHub", "url": "https://github.com/octocat", "status": "Claimed"}}',
+            '{"url_user": null, "status": {"site_name": "Reddit", "status": "Available"}}',
             "not a json line",
         ]
     )
@@ -106,9 +107,29 @@ def main() -> int:
             "[*] Email: test@example.com",
         ]
     )
-    bb = parse_blackbird(blackbird_sample)
+    bb = parse_blackbird_text(blackbird_sample)
     check("blackbird: url", any(f.url == "https://github.com/octocat" for f in bb))
-    check("blackbird: csv", any(f.source == "Reddit" for f in bb))
+    check("blackbird: csv", len(bb) >= 2)
+
+    bb_json = parse_blackbird_json(
+        [{"name": "GitHub", "url": "https://github.com/octocat", "category": "coding", "status": "FOUND"}]
+    )
+    check(
+        "blackbird: json",
+        len(bb_json) == 1 and bb_json[0].source == "GitHub" and bb_json[0].details == "coding",
+    )
+
+    maigret_file = (
+        '{"site": {"urlMain": "https://github.com/"}, "url_user": "https://github.com/octocat",'
+        ' "status": {"site_name": "GitHub", "url": "https://github.com/octocat", "status": "Claimed",'
+        ' "ids": {"fullname": "The Octocat", "location": "San Francisco", "created_at": "2011-01-25T18:44:36Z"}}}'
+    )
+    mf = parse_maigret(maigret_file)
+    check(
+        "maigret: ndjson-файл",
+        len(mf) == 1 and mf[0].source == "GitHub" and "The Octocat" in (mf[0].details or ""),
+        str(mf),
+    )
 
     cdx = [["timestamp", "original", "statuscode"], ["20200101120000", "example.com", "200"]]
     cdx_findings = parse_cdx(cdx)

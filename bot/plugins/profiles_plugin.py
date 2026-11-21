@@ -153,6 +153,8 @@ class ProfilesPlugin(OSINTPlugin):
             )
             if status == 404:
                 return [], ""
+            if status == 403:
+                return [], f"{name}: 403 — площадка блокирует серверные IP"
             if status == 0:
                 return [], f"{name}: {error}"
             if status != 200:

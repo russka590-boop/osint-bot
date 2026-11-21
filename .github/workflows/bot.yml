@@ -35,6 +35,11 @@ jobs:
           pip install -r requirements.txt
           pip install maigret
 
+      - name: Установка BlackBird
+        run: |
+          git clone --depth 1 https://github.com/p1ngul1n0/blackbird /opt/blackbird
+          pip install rich reportlab pillow chardet requests python-dotenv
+
       - name: Запуск бота
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
@@ -43,6 +48,8 @@ jobs:
           VK_TOKEN: ${{ secrets.VK_TOKEN }}
           MAIGRET_ARGS: "-a"
           MAIGRET_TIMEOUT: "900"
+          BLACKBIRD_CMD: "python /opt/blackbird/blackbird.py"
+          BLACKBIRD_TIMEOUT: "600"
         run: timeout 340m python main.py || true
 
       - name: Сохранить базу
