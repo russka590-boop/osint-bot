@@ -7,18 +7,37 @@ from aiogram import BaseMiddleware
 from aiogram.types import CallbackQuery, Message, TelegramObject
 
 from bot.config import settings
+from bot.policy import POLICY_VERSION
 
 Handler = Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]]
 
 DENY_TEXT = "Доступ к боту закрыт. Напишите /msg ваш_текст, чтобы отправить заявку администратору."
-PUBLIC_COMMANDS = ("/start", "/help", "/msg")
+PUBLIC_COMMANDS = ("/start", "/help", "/msg", "/privacy")
 
 _role_lookup: Callable[[int], Awaitable[str | None]] | None = None
+_consent_lookup: Callable[[int], Awaitable[str | None]] | None = None
 
 
 def bind_roles(lookup: Callable[[int], Awaitable[str | None]]) -> None:
     global _role_lookup
     _role_lookup = lookup
+
+
+def bind_consent(lookup: Callable[[int], Awaitable[str | None]]) -> None:
+    global _consent_lookup
+    _consent_lookup = lookup
+
+
+async def has_consent(user_id: int) -> bool:
+    if settings.is_admin(user_id):
+        return True
+    if _consent_lookup is None:
+        return True
+    try:
+        version = await _consent_lookup(user_id)
+    except Exception:  # noqa: BLE001
+        return True
+    return version == POLICY_VERSION
 
 
 async def is_allowed(user_id: int) -> bool:
@@ -43,6 +62,21 @@ class AccessMiddleware(BaseMiddleware):
         user = data.get("event_from_user")
         if user is None:
             return await handler(event, data)
+        if not await has_consent(user.id):
+            command = ""
+            if isinstance(event, Message):
+                command = (event.text or "").split(maxsplit=1)[0].split("@")[0].lower()
+                if command in ("/start", "/privacy"):
+                    return await handler(event, data)
+                await event.answer(
+                    "Сначала примите политику конфиденциальности: /privacy"
+                )
+                return None
+            if isinstance(event, CallbackQuery):
+                if (event.data or "").startswith("consent:"):
+                    return await handler(event, data)
+                await event.answer("Сначала примите политику: /privacy", show_alert=True)
+            return None
         if not await is_allowed(user.id):
             if isinstance(event, Message):
                 command = (event.text or "").split(maxsplit=1)[0].split("@")[0].lower()

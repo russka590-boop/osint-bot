@@ -12,6 +12,15 @@ ENGINE_TITLES = {
 }
 
 
+def consent_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Согласен", callback_data="consent:yes")],
+            [InlineKeyboardButton(text="Не согласен", callback_data="consent:no")],
+        ]
+    )
+
+
 def kinds_keyboard(show_admin: bool = False) -> InlineKeyboardMarkup:
     rows = [
         [

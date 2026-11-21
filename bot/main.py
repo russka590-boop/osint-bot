@@ -23,14 +23,27 @@ from aiogram.types import (
 
 from bot.config import settings
 from bot.core import net
-from bot.core.access import AccessMiddleware, bind_roles, cooldown, is_allowed
+from bot.core.access import (
+    AccessMiddleware,
+    bind_consent,
+    bind_roles,
+    cooldown,
+    has_consent,
+    is_allowed,
+)
 from bot.core.plugin import REGISTRY, TargetKind, plugins_for
 from bot.core.report import build_markdown, summary_text, write_report
 from bot.core.runner import Runner
 from bot.core.storage import Storage
 from bot.core.utils import chunk, detect_kind, human_duration, normalize
-from bot.keyboards import ENGINE_TITLES, engines_keyboard, kinds_keyboard
+from bot.keyboards import (
+    ENGINE_TITLES,
+    consent_keyboard,
+    engines_keyboard,
+    kinds_keyboard,
+)
 from bot.plugins import load_plugins
+from bot.policy import POLICY_VERSION, PRIVACY_TEXT
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +70,7 @@ WELCOME = (
     "/plugins — какие модули доступны\n"
     "/stats — ваша статистика\n"
     "/msg <текст> — написать администратору\n"
+    "/privacy — политика конфиденциальности\n"
     "/cancel — сбросить выбор\n\n"
     "Сообщения, отправленные боту, сохраняются для модерации и разбора обращений.\n\n"
     "Выберите тип цели:"
@@ -77,15 +91,57 @@ def _db() -> Storage:
 async def cmd_start(message: Message) -> None:
     await track_user(message)
     user = message.from_user
-    if user is not None and not await is_allowed(user.id):
+    if user is None:
+        return
+    if not await has_consent(user.id):
+        await message.answer(PRIVACY_TEXT[:4000], reply_markup=consent_keyboard())
+        return
+    if not await is_allowed(user.id):
         await message.answer(
             "У вас пока нет доступа.\n"
             "Напишите /msg ваш текст — заявка уйдёт администратору.\n"
             f"Ваш ID: {user.id}"
         )
         return
-    show_admin = bool(user and settings.is_admin(user.id))
+    show_admin = settings.is_admin(user.id)
     await message.answer(WELCOME, reply_markup=kinds_keyboard(show_admin))
+
+
+@router.message(Command("privacy"))
+async def cmd_privacy(message: Message) -> None:
+    user = message.from_user
+    agreed = bool(user and await has_consent(user.id)) and not settings.is_admin(user.id)
+    await message.answer(
+        PRIVACY_TEXT[:4000],
+        reply_markup=consent_keyboard() if not agreed else None,
+    )
+
+
+@router.callback_query(F.data == "consent:yes")
+async def cb_consent_yes(callback: CallbackQuery) -> None:
+    user = callback.from_user
+    await _db().register_user(user.id, user.username, user.first_name)
+    await _db().set_consent(user.id, POLICY_VERSION)
+    await callback.message.answer("Согласие принято. Спасибо.")
+    if await is_allowed(user.id):
+        await callback.message.answer(
+            WELCOME, reply_markup=kinds_keyboard(settings.is_admin(user.id))
+        )
+    else:
+        await callback.message.answer(
+            "Доступ пока закрыт. Напишите /msg ваш текст — заявка уйдёт администратору."
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "consent:no")
+async def cb_consent_no(callback: CallbackQuery) -> None:
+    await _db().clear_consent(callback.from_user.id)
+    await callback.message.answer(
+        "Без согласия бот не обрабатывает данные и не выполняет запросы.\n"
+        "Если передумаете — вернитесь командой /start."
+    )
+    await callback.answer()
 
 
 @router.message(Command("help"))
@@ -763,6 +819,7 @@ async def _set_commands(bot: Bot) -> None:
             BotCommand(command="plugins", description="доступные модули"),
             BotCommand(command="stats", description="моя статистика"),
             BotCommand(command="msg", description="написать администратору"),
+            BotCommand(command="privacy", description="политика конфиденциальности"),
             BotCommand(command="cancel", description="сбросить выбор"),
             BotCommand(command="admin", description="админ-панель"),
         ]
@@ -778,6 +835,7 @@ async def main() -> None:
     storage = Storage(settings.db_path)
     await storage.connect()
     bind_roles(storage.get_role)
+    bind_consent(storage.get_consent)
     load_plugins()
 
     bot = Bot(settings.token, default=DefaultBotProperties())

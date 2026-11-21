@@ -56,6 +56,11 @@ async def storage_checks() -> None:
 
         await store.set_setting("auto_reply", "текст")
         check("storage: настройка", await store.get_setting("auto_reply") == "текст")
+        check("storage: согласие по умолчанию", await store.get_consent(1) is None)
+        await store.set_consent(1, "1.0")
+        check("storage: согласие выдано", await store.get_consent(1) == "1.0")
+        await store.clear_consent(1)
+        check("storage: согласие отозвано", await store.get_consent(1) is None)
         check("storage: список пользователей", await store.all_user_ids() == [1])
         await store.close()
 

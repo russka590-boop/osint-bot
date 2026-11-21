@@ -74,7 +74,17 @@ class Storage:
         self._db = await aiosqlite.connect(self._path)
         self._db.row_factory = aiosqlite.Row
         await self._db.executescript(SCHEMA)
+        await self._migrate()
         await self._db.commit()
+
+    async def _migrate(self) -> None:
+        db = self._conn()
+        cursor = await db.execute("PRAGMA table_info(users)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        await cursor.close()
+        for column in ("consent_at", "consent_version"):
+            if column not in columns:
+                await db.execute(f"ALTER TABLE users ADD COLUMN {column} TEXT")
 
     async def close(self) -> None:
         if self._db is not None:
@@ -287,6 +297,32 @@ class Storage:
         rows = await cursor.fetchall()
         await cursor.close()
         return [int(row[0]) for row in rows]
+
+    async def get_consent(self, user_id: int) -> str | None:
+        db = self._conn()
+        cursor = await db.execute(
+            "SELECT consent_version FROM users WHERE user_id = ?", (user_id,)
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return str(row[0]) if row and row[0] else None
+
+    async def set_consent(self, user_id: int, version: str) -> bool:
+        db = self._conn()
+        cursor = await db.execute(
+            "UPDATE users SET consent_at = ?, consent_version = ? WHERE user_id = ?",
+            (_now(), version, user_id),
+        )
+        await db.commit()
+        return bool(cursor.rowcount)
+
+    async def clear_consent(self, user_id: int) -> None:
+        db = self._conn()
+        await db.execute(
+            "UPDATE users SET consent_at = NULL, consent_version = NULL WHERE user_id = ?",
+            (user_id,),
+        )
+        await db.commit()
 
     async def get_setting(self, key: str) -> str | None:
         db = self._conn()
